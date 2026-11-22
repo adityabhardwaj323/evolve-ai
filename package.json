@@ -14,7 +14,7 @@
     "build": "npm run build --workspace=@evolve-ai/shared-types && npm run build --workspace=@evolve-ai/provider-sdk && npm run build --workspace=@evolve-ai/memory-engine && npm run build --workspace=apps/web",
     "lint": "npm run lint --workspaces --if-present",
     "typecheck": "npm run typecheck --workspaces --if-present",
-    "test": "npm run test --workspace=workers/api"
+    "test": "npm run test --workspace=@evolve-ai/provider-sdk && npm run test --workspace=workers/api"
   },
   "keywords": [
     "ai",

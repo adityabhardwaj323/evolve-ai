@@ -14,6 +14,8 @@ export interface ProviderCapability {
   supportsModelDiscovery: boolean;
   supportsSystemPrompt: boolean;
   supportsUsageReporting: boolean;
+  supportsTools?: boolean;
+  supportsVision?: boolean;
   maxContextTokens?: number;
 }
 
@@ -24,6 +26,17 @@ export interface ModelDescriptor {
   contextWindow?: number;
   description?: string;
   isDefault?: boolean;
+  capabilities?: ProviderCapability;
+}
+
+export interface ProviderMetadata {
+  id: ProviderType;
+  name: string;
+  description: string;
+  website: string;
+  docUrl: string;
+  defaultModel: string;
+  capabilities: ProviderCapability;
 }
 
 export interface User {
@@ -70,6 +83,77 @@ export interface Message {
   tokenCount?: number;
   metadata?: Record<string, unknown>;
   createdAt: string;
+}
+
+export interface UsageMetadata {
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+  estimatedCostUsd?: number;
+}
+
+export interface UsageEvent {
+  id: string;
+  userId: string;
+  conversationId?: string | null;
+  providerType: ProviderType;
+  model: string;
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+  success: boolean;
+  createdAt: string;
+}
+
+export type StreamEventType =
+  | 'message_start'
+  | 'content_delta'
+  | 'reasoning_delta'
+  | 'usage'
+  | 'message_complete'
+  | 'error';
+
+export interface StreamEvent {
+  type: StreamEventType;
+  content?: string;
+  model?: string;
+  provider?: ProviderType;
+  usage?: UsageMetadata;
+  error?: string;
+}
+
+export interface CompareRequest {
+  prompt: string;
+  modelA: {
+    providerType: ProviderType;
+    model: string;
+    credentialId?: string;
+  };
+  modelB: {
+    providerType: ProviderType;
+    model: string;
+    credentialId?: string;
+  };
+}
+
+export interface CompareResponse {
+  prompt: string;
+  responseA: {
+    providerType: ProviderType;
+    model: string;
+    content: string;
+    usage?: UsageMetadata;
+    error?: string;
+    latencyMs: number;
+  };
+  responseB: {
+    providerType: ProviderType;
+    model: string;
+    content: string;
+    usage?: UsageMetadata;
+    error?: string;
+    latencyMs: number;
+  };
 }
 
 export type MemoryCategory =

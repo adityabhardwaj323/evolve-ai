@@ -16,7 +16,9 @@ All user data is strictly isolated by `user_id`. Queries must always bind `user_
 11. `evaluations` — Objective benchmarks measuring memory retrieval and response improvements.
 12. `user_preferences` — System configuration flags (e.g. auto memory extraction).
 13. `login_attempts` — IP and email brute-force tracking and lockout timestamps.
+14. `usage_events` — Token consumption tracking per generation for cost observability.
 
 ## Migration History
 - `0001_initial_schema.sql`: Core 12 relational tables with foreign keys and indexes.
 - `0002_security_and_credentials.sql`: Added `encryption_version` to `provider_credentials` for key rotation, and `login_attempts` table for rate limiting.
+- `0003_usage_and_provider_defaults.sql`: Added `is_default` to `provider_credentials` and created `usage_events` table for token tracking.

@@ -43,12 +43,36 @@
   - 9 end-to-end integration tests (`vitest run tests/integration.test.ts`).
   - Verified Alice cannot read, delete, or decrypt Bob's data through actual API routes.
 
-### Milestone 3: Multi-Provider Integration (BYOK)
-- [ ] Google Gemini Adapter.
-- [ ] OpenAI Adapter.
-- [ ] Anthropic Claude Adapter.
-- [ ] Provider validation & model listing endpoints.
-- [ ] Provider management UI in web app.
+### Milestone 3: Multi-Provider Integration (BYOK), Streaming & Unified AI Workspace
+- [x] Complete multi-provider SDK (`@evolve-ai/provider-sdk`) and central registry pattern.
+- [x] Implemented independent adapters for all 6 supported providers:
+  - Google Gemini (`GeminiAdapter`) with multimodal streaming and token usage reporting.
+  - OpenAI (`OpenAIAdapter`) with standard chat completions and usage reporting.
+  - Anthropic Claude (`ClaudeAdapter`) with messages API, streaming SSE parser, and input/output tokens.
+  - xAI Grok (`GrokAdapter`) with xAI OpenAI-compatible API.
+  - Mistral AI (`MistralAdapter`) with Mistral API endpoints.
+  - OpenRouter (`OpenRouterAdapter`) gateway to open-weights models (Llama 3.3, DeepSeek, Qwen).
+- [x] BYOK AES-256-GCM credential management (`/providers/credentials/*`):
+  - In-memory decryption only; zero plaintext key leaks to logs or responses.
+  - User-triggered manual connection testing endpoint (`POST /providers/credentials/:id/test`).
+  - Default provider and model selection.
+- [x] AI Chat Workspace with real Server-Sent Events (SSE) streaming (`POST /chat/stream`):
+  - Live token streaming with stop generation cancellation (`AbortController`).
+  - Conversation and message persistence in Cloudflare D1.
+  - Auto-scrolling, conversation history sidebar, and model switching.
+- [x] Dual-Model Comparison Mode (`POST /chat/compare`):
+  - Concurrent dispatch to two separate user-connected models via `Promise.all`.
+  - Side-by-side desktop layout and responsive mobile stacking.
+  - Independent latency and error boundary handling.
+- [x] Usage & Token Observability (`GET /usage`):
+  - D1 `usage_events` tracking prompt, completion, and total tokens.
+  - Aggregated metrics and recent event logs.
+- [x] New D1 database migration (`0003_usage_and_provider_defaults.sql`).
+- [x] Automated test suites:
+  - Unit tests for provider adapters and registry (`6 passed`).
+  - Security unit tests (`27 passed`).
+  - E2E API integration tests (`13 passed`).
+  - 100% typecheck and production build passing.
 
 ### Milestone 4: AI Workspace
 - [ ] Chat conversation persistence in D1.

@@ -1,12 +1,14 @@
 import { Hono } from 'hono';
 import { cors } from 'hono/cors';
 import { logger } from 'hono/logger';
-import { verifyCsrfAndOrigin } from './middleware/csrf';
-import { authRouter } from './auth/routes';
-import { providersRouter } from './routes/providers';
-import { conversationsRouter } from './routes/conversations';
-import { memoryRouter } from './routes/memory';
-import { projectsRouter } from './routes/projects';
+import { verifyCsrfAndOrigin } from './middleware/csrf.js';
+import { authRouter } from './auth/routes.js';
+import { providersRouter } from './routes/providers.js';
+import { chatRouter } from './routes/chat.js';
+import { conversationsRouter } from './routes/conversations.js';
+import { memoryRouter } from './routes/memory.js';
+import { projectsRouter } from './routes/projects.js';
+import { usageRouter } from './routes/usage.js';
 
 export interface Env {
   DB: D1Database;
@@ -47,11 +49,10 @@ app.use('*', async (c, next) => {
 // Modern Security response headers middleware
 app.use('*', async (c, next) => {
   await next();
-  // 1. Content Security Policy for React/Vite SPA
   const csp = [
     "default-src 'self'",
     "script-src 'self'",
-    "style-src 'self' 'unsafe-inline'", // required for Tailwind / inline theme styles
+    "style-src 'self' 'unsafe-inline'",
     "img-src 'self' data: https:",
     "font-src 'self' data:",
     "connect-src 'self' http://localhost:5173 http://localhost:8787 " + (c.env.CLIENT_ORIGIN || ''),
@@ -65,7 +66,6 @@ app.use('*', async (c, next) => {
   c.header('X-Frame-Options', 'DENY');
   c.header('Referrer-Policy', 'strict-origin-when-cross-origin');
   c.header('Permissions-Policy', 'camera=(), microphone=(), geolocation=(), payment=()');
-  // Note: Legacy X-XSS-Protection header deliberately omitted as per modern web standards
 });
 
 // CSRF & Origin protection middleware for state-changing endpoints
@@ -85,15 +85,17 @@ app.get('/health', (c) => {
 app.get('/', (c) => {
   return c.json({
     name: 'EvolveAI API',
-    version: '0.1.0',
+    version: '0.3.0',
     description: 'Personal, Model-Agnostic, Self-Evolving AI Intelligence Platform',
     endpoints: {
       health: '/health',
       auth: '/auth/*',
       providers: '/providers/*',
-      chat: '/conversations/*',
+      chat: '/chat/*',
+      conversations: '/conversations/*',
       memory: '/memory/*',
       projects: '/projects/*',
+      usage: '/usage/*',
     },
   });
 });
@@ -101,9 +103,11 @@ app.get('/', (c) => {
 // Mount modular sub-routers
 app.route('/auth', authRouter);
 app.route('/providers', providersRouter);
+app.route('/chat', chatRouter);
 app.route('/conversations', conversationsRouter);
 app.route('/memory', memoryRouter);
 app.route('/projects', projectsRouter);
+app.route('/usage', usageRouter);
 
 // Error handling
 app.onError((err, c) => {
