@@ -1,0 +1,33 @@
+{
+  "name": "evolve-ai",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Personal, Model-Agnostic, Self-Evolving AI Intelligence Platform",
+  "workspaces": [
+    "apps/*",
+    "workers/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev:web": "npm run dev --workspace=apps/web",
+    "dev:api": "npm run dev --workspace=workers/api",
+    "build": "npm run build --workspace=@evolve-ai/shared-types && npm run build --workspace=@evolve-ai/provider-sdk && npm run build --workspace=@evolve-ai/memory-engine && npm run build --workspace=apps/web",
+    "lint": "npm run lint --workspaces --if-present",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "test": "npm run test:security --workspace=workers/api"
+  },
+  "keywords": [
+    "ai",
+    "byok",
+    "memory-engine",
+    "self-evolving",
+    "knowledge-graph",
+    "cloudflare-workers",
+    "cloudflare-d1"
+  ],
+  "author": "EvolveAI Team",
+  "license": "MIT",
+  "devDependencies": {
+    "tsx": "^4.23.15"
+  }
+}
