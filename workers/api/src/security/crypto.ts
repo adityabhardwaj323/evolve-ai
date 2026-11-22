@@ -1,23 +1,24 @@
 /**
  * Web Crypto AES-256-GCM Credential Encryption Service
  * 
- * Complies with strict security requirements:
- * - AES-256-GCM with 256-bit key.
- * - Key derived from server secret (ENCRYPTION_SECRET) via SHA-256 HKDF or single-step SHA-256 digest.
- * - Unique 12-byte cryptographically random IV per operation.
- * - Authenticated Additional Data (AAD) binding ciphertext to:
+ * Cryptographic Architecture:
+ * - Master Secret: Minimum 32-character random string from Cloudflare Worker Secret.
+ * - Key Derivation: RFC 5869 HKDF-SHA256 with documented fixed salt and application-specific info.
+ * - Cipher: AES-256-GCM with 128-bit authentication tag appended directly to ciphertext.
+ * - IV: Cryptographically random 12-byte (96-bit) IV per encryption call.
+ * - Authenticated Additional Data (AAD): Canonical JSON string binding:
  *     - userId
  *     - credentialId
- *     - encryptionVersion
- * - Tamper detection (throws on modified ciphertext, bad IV, or mismatched AAD).
- * - Decrypted keys must never leave Worker memory or be logged.
+ *     - version
+ * - Zero extra aad_tag column needed (Web Crypto AES-GCM appends tag directly).
+ * - Decrypted keys never leave Worker memory or get exposed in responses or logs.
  */
 
 export interface EncryptedPayload {
-  encryptedKey: string;      // Base64 encoded ciphertext + tag
+  encryptedKey: string;      // Base64 encoded ciphertext + 16-byte authentication tag
   keyIv: string;             // Base64 encoded 12-byte IV
-  encryptionVersion: number; // For rotation tracking
-  maskedKey: string;         // e.g. "sk-...ab12"
+  encryptionVersion: number; // Stored for key rotation
+  maskedKey: string;         // e.g. "sk-a••••••••99ab"
 }
 
 export interface AADContext {
@@ -26,11 +27,13 @@ export interface AADContext {
   version: number;
 }
 
-const CURRENT_ENCRYPTION_VERSION = 1;
-const IV_LENGTH_BYTES = 12; // Standard 96-bit IV for AES-GCM
+export const CURRENT_ENCRYPTION_VERSION = 1;
+const IV_LENGTH_BYTES = 12; // 96-bit IV
+const HKDF_INFO_PREFIX = 'evolve-ai:byok-key-derivation:v';
+const HKDF_FIXED_SALT = new TextEncoder().encode('evolve-ai:fixed-credential-salt-v1');
 
 /**
- * Validates the runtime encryption configuration.
+ * Validates that the runtime encryption secret satisfies 256-bit entropy requirements.
  */
 export function validateEncryptionConfiguration(secret?: string): void {
   if (!secret || typeof secret !== 'string') {
@@ -42,36 +45,55 @@ export function validateEncryptionConfiguration(secret?: string): void {
 }
 
 /**
- * Derives a CryptoKey for AES-256-GCM using SHA-256 digest of the master secret.
+ * Derives a 256-bit AES-GCM CryptoKey using HKDF-SHA256.
+ * Binds derivation to the specific encryption version.
  */
-async function deriveMasterKey(secret: string): Promise<CryptoKey> {
+export async function deriveKeyWithHKDF(secret: string, version: number = CURRENT_ENCRYPTION_VERSION): Promise<CryptoKey> {
   validateEncryptionConfiguration(secret);
   const enc = new TextEncoder();
   const secretBytes = enc.encode(secret);
-  
-  // Hash the secret to ensure exactly 32 bytes (256 bits)
-  const keyMaterial = await crypto.subtle.digest('SHA-256', secretBytes);
 
-  return crypto.subtle.importKey(
+  // Import base key material
+  const baseKey = await crypto.subtle.importKey(
     'raw',
-    keyMaterial,
-    { name: 'AES-GCM' },
+    secretBytes,
+    { name: 'HKDF' },
+    false,
+    ['deriveKey']
+  );
+
+  const infoBytes = enc.encode(`${HKDF_INFO_PREFIX}${version}`);
+
+  // Derive AES-256-GCM key via HKDF-SHA256
+  return crypto.subtle.deriveKey(
+    {
+      name: 'HKDF',
+      hash: 'SHA-256',
+      salt: HKDF_FIXED_SALT,
+      info: infoBytes,
+    },
+    baseKey,
+    { name: 'AES-GCM', length: 256 },
     false,
     ['encrypt', 'decrypt']
   );
 }
 
 /**
- * Formats Authenticated Additional Data (AAD) into bytes.
+ * Serializes canonical AAD buffer consistently for encryption and decryption.
+ * Canonical JSON with sorted keys.
  */
-function createAADBuffer(context: AADContext): Uint8Array {
-  const aadString = `evolve-ai:v${context.version}:user:${context.userId}:cred:${context.credentialId}`;
-  return new TextEncoder().encode(aadString);
+export function createCanonicalAAD(context: AADContext): Uint8Array {
+  const canonicalString = JSON.stringify({
+    credentialId: context.credentialId,
+    userId: context.userId,
+    version: context.version,
+  });
+  return new TextEncoder().encode(canonicalString);
 }
 
 /**
- * Helper to produce a safe masked string for user display.
- * Never displays more than the prefix and suffix.
+ * Masks an API key for safe user display.
  */
 export function maskApiKey(apiKey: string): string {
   const trimmed = apiKey.trim();
@@ -84,27 +106,29 @@ export function maskApiKey(apiKey: string): string {
 }
 
 /**
- * Encrypts an API credential using AES-256-GCM with unique IV and AAD binding.
+ * Encrypts an API credential using AES-256-GCM + HKDF derived key + 12-byte IV + canonical AAD.
  */
 export async function encryptCredential(
   apiKey: string,
   secret: string,
-  context: { userId: string; credentialId: string }
+  context: { userId: string; credentialId: string },
+  version: number = CURRENT_ENCRYPTION_VERSION
 ): Promise<EncryptedPayload> {
   if (!apiKey || apiKey.trim().length === 0) {
     throw new Error('Cannot encrypt empty API key.');
   }
 
-  const masterKey = await deriveMasterKey(secret);
+  const derivedKey = await deriveKeyWithHKDF(secret, version);
   const iv = crypto.getRandomValues(new Uint8Array(IV_LENGTH_BYTES));
-  const aad = createAADBuffer({
+  const aad = createCanonicalAAD({
     userId: context.userId,
     credentialId: context.credentialId,
-    version: CURRENT_ENCRYPTION_VERSION,
+    version,
   });
 
   const plaintextBytes = new TextEncoder().encode(apiKey.trim());
 
+  // Web Crypto AES-GCM automatically appends the 128-bit authentication tag to the ciphertext buffer
   const cipherBuffer = await crypto.subtle.encrypt(
     {
       name: 'AES-GCM',
@@ -112,21 +136,21 @@ export async function encryptCredential(
       additionalData: aad,
       tagLength: 128,
     },
-    masterKey,
+    derivedKey,
     plaintextBytes
   );
 
   return {
     encryptedKey: uint8ArrayToBase64(new Uint8Array(cipherBuffer)),
     keyIv: uint8ArrayToBase64(iv),
-    encryptionVersion: CURRENT_ENCRYPTION_VERSION,
+    encryptionVersion: version,
     maskedKey: maskApiKey(apiKey),
   };
 }
 
 /**
- * Decrypts an API credential using AES-256-GCM.
- * Validates AAD (userId, credentialId, version). Throws error if corrupted or mismatched.
+ * Decrypts an API credential using AES-256-GCM + HKDF derived key + canonical AAD verification.
+ * Throws if ciphertext is tampered with, wrong key is used, or AAD does not match.
  */
 export async function decryptCredential(
   payload: {
@@ -137,11 +161,11 @@ export async function decryptCredential(
   secret: string,
   context: { userId: string; credentialId: string }
 ): Promise<string> {
-  const masterKey = await deriveMasterKey(secret);
+  const derivedKey = await deriveKeyWithHKDF(secret, payload.encryptionVersion);
   const iv = base64ToUint8Array(payload.keyIv);
-  const ciphertext = base64ToUint8Array(payload.encryptedKey);
+  const ciphertextWithTag = base64ToUint8Array(payload.encryptedKey);
 
-  const aad = createAADBuffer({
+  const aad = createCanonicalAAD({
     userId: context.userId,
     credentialId: context.credentialId,
     version: payload.encryptionVersion,
@@ -155,17 +179,16 @@ export async function decryptCredential(
         additionalData: aad,
         tagLength: 128,
       },
-      masterKey,
-      ciphertext
+      derivedKey,
+      ciphertextWithTag
     );
 
     return new TextDecoder().decode(decryptedBuffer);
   } catch (err) {
-    throw new Error('Decryption failed: Ciphertext corrupted, invalid secret, or ownership mismatch (AAD failure).');
+    throw new Error('Decryption failed: Authentication tag verification failed (ciphertext corrupted, wrong secret, or AAD mismatch).');
   }
 }
 
-// Base64 encoding/decoding helpers using standard Web APIs
 function uint8ArrayToBase64(bytes: Uint8Array): string {
   let binary = '';
   const len = bytes.byteLength;

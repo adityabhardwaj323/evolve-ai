@@ -1,12 +1,12 @@
 /**
  * Session Security & Management Service
  * 
- * Complies with strict security rules:
- * - Opaque 32-byte cryptographically random session token generated using Web Crypto.
+ * - Opaque 32-byte cryptographically random session token.
+ * - Base64url encoding for URL & Cookie safety without delimiter conflicts.
  * - Stores ONLY the SHA-256 hash of the token in D1 (`token_hash`).
- * - Raw token is delivered to the client via HttpOnly, Secure, SameSite cookie.
- * - Tokens never stored in localStorage.
- * - Enforces session expiration and revocation.
+ * - Delivered to the client via HttpOnly, Secure, SameSite=Lax (or Strict) cookie.
+ * - Raw token is never stored in D1 and never stored in localStorage.
+ * - Session expiration check and active invalidation on logout.
  */
 
 export interface SessionInfo {
@@ -19,17 +19,29 @@ export const SESSION_COOKIE_NAME = 'evolve_session';
 export const SESSION_TTL_SECONDS = 7 * 24 * 60 * 60; // 7 days
 
 /**
- * Generates an opaque cryptographically random session token (64-char hex string).
+ * Base64url encoding for binary arrays (RFC 4648).
  */
-export function generateSessionToken(): string {
-  const bytes = crypto.getRandomValues(new Uint8Array(32));
-  return Array.from(bytes)
-    .map((b) => b.toString(16).padStart(2, '0'))
-    .join('');
+export function bufferToBase64Url(buffer: Uint8Array): string {
+  let binary = '';
+  for (let i = 0; i < buffer.byteLength; i++) {
+    binary += String.fromCharCode(buffer[i]);
+  }
+  return btoa(binary)
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=+$/, '');
 }
 
 /**
- * Computes a SHA-256 hash of the session token for secure storage and comparison.
+ * Generates an opaque cryptographically random 32-byte session token encoded in base64url.
+ */
+export function generateSessionToken(): string {
+  const bytes = crypto.getRandomValues(new Uint8Array(32));
+  return bufferToBase64Url(bytes);
+}
+
+/**
+ * Computes a SHA-256 hash of the session token for secure database storage and comparison.
  */
 export async function hashSessionToken(token: string): Promise<string> {
   const enc = new TextEncoder();
@@ -68,7 +80,6 @@ export async function createSession(
 
 /**
  * Validates a session token against D1.
- * Returns the associated User record if valid and unexpired; null otherwise.
  */
 export async function validateSession(
   db: D1Database,
@@ -117,7 +128,7 @@ export async function validateSession(
 }
 
 /**
- * Revokes a session in D1 (used on Logout).
+ * Revokes a session in D1.
  */
 export async function revokeSession(db: D1Database, rawToken: string): Promise<boolean> {
   if (!rawToken) return false;
@@ -127,7 +138,7 @@ export async function revokeSession(db: D1Database, rawToken: string): Promise<b
 }
 
 /**
- * Builds the Set-Cookie header string with HttpOnly, Secure, SameSite attributes.
+ * Builds the Set-Cookie header string with HttpOnly, Secure, SameSite=Lax.
  */
 export function buildSessionCookie(token: string, expiresAt: Date, isProduction: boolean): string {
   const secureFlag = isProduction ? 'Secure;' : '';
@@ -135,7 +146,7 @@ export function buildSessionCookie(token: string, expiresAt: Date, isProduction:
 }
 
 /**
- * Builds the deletion cookie header string to clear the session cookie.
+ * Builds the deletion cookie header string.
  */
 export function buildClearSessionCookie(): string {
   return `${SESSION_COOKIE_NAME}=; Path=/; Expires=Thu, 01 Jan 1970 00:00:00 GMT; HttpOnly; SameSite=Lax`;

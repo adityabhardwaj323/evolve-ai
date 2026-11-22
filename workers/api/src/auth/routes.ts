@@ -1,6 +1,6 @@
 import { Hono } from 'hono';
 import { Env } from '../index';
-import { hashPassword, verifyPassword } from './passwords';
+import { hashPassword, verifyPassword, validatePassword } from './passwords';
 import {
   createSession,
   revokeSession,
@@ -8,23 +8,23 @@ import {
   buildClearSessionCookie,
   SESSION_COOKIE_NAME,
 } from './sessions';
-import { checkRateLimit, recordFailedLogin, clearLoginAttempts } from './rate-limit';
+import { checkRateLimit, recordFailedLogin, clearAccountFailures, recordIpRequest } from './rate-limit';
 import { requireAuth, AuthContext } from '../middleware/auth';
 
 export const authRouter = new Hono<{ Bindings: Env; Variables: AuthContext }>();
 
-/**
- * Helper to validate email format
- */
 function isValidEmail(email: string): boolean {
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
 }
 
 /**
  * POST /auth/register
- * Registers a new user.
+ * Registers a new user with minimum 12-char normalized password and stored iteration metadata.
  */
 authRouter.post('/register', async (c) => {
+  const ip = c.req.header('CF-Connecting-IP') || c.req.header('x-forwarded-for') || '127.0.0.1';
+  await recordIpRequest(c.env.DB, ip);
+
   const body = await c.req.json().catch(() => null);
   if (!body) {
     return c.json({ success: false, error: { code: 'BAD_REQUEST', message: 'Invalid JSON body' } }, 400);
@@ -36,17 +36,17 @@ authRouter.post('/register', async (c) => {
     return c.json({ success: false, error: { code: 'INVALID_EMAIL', message: 'A valid email address is required.' } }, 400);
   }
 
-  if (!password || typeof password !== 'string' || password.length < 8) {
-    return c.json({ success: false, error: { code: 'WEAK_PASSWORD', message: 'Password must be at least 8 characters long.' } }, 400);
+  const passwordValidation = validatePassword(password);
+  if (!passwordValidation.valid) {
+    return c.json({ success: false, error: { code: 'WEAK_PASSWORD', message: passwordValidation.error || 'Password requirement not met.' } }, 400);
   }
 
+  const normEmail = email.toLowerCase().trim();
   const userName = (name && typeof name === 'string' && name.trim().length > 0)
     ? name.trim()
-    : email.split('@')[0];
+    : normEmail.split('@')[0];
 
-  const normEmail = email.toLowerCase().trim();
-
-  // Check for duplicate email
+  // Check duplicate email
   const existing = await c.env.DB
     .prepare('SELECT id FROM users WHERE email = ? LIMIT 1')
     .bind(normEmail)
@@ -56,20 +56,19 @@ authRouter.post('/register', async (c) => {
     return c.json({ success: false, error: { code: 'EMAIL_EXISTS', message: 'An account with this email already exists.' } }, 409);
   }
 
-  // Hash password with Web Crypto PBKDF2 (100k iterations)
-  const { hash, salt } = await hashPassword(password);
+  // Hash with PBKDF2-HMAC-SHA256 and store algorithm & iteration metadata
+  const { hash, salt, algorithm, iterations } = await hashPassword(password);
   const userId = crypto.randomUUID();
 
-  // Insert user
   await c.env.DB
     .prepare(
-      `INSERT INTO users (id, email, password_hash, salt, name, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`
+      `INSERT INTO users (id, email, password_hash, salt, name, hash_algorithm, hash_iterations, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`
     )
-    .bind(userId, normEmail, hash, salt, userName)
+    .bind(userId, normEmail, hash, salt, userName, algorithm, iterations)
     .run();
 
-  // Initialize default user preferences
+  // Initialize default preferences
   await c.env.DB
     .prepare(
       `INSERT INTO user_preferences (id, user_id, auto_memory_extract, theme, created_at, updated_at)
@@ -85,39 +84,42 @@ authRouter.post('/register', async (c) => {
 
   c.header('Set-Cookie', cookie);
 
-  return c.json({
-    success: true,
-    data: {
-      user: {
-        id: userId,
-        email: normEmail,
-        name: userName,
+  return c.json(
+    {
+      success: true,
+      data: {
+        user: {
+          id: userId,
+          email: normEmail,
+          name: userName,
+        },
+        token: session.token,
       },
-      token: session.token, // Return token for optional Authorization header usage
     },
-  }, 201);
+    201
+  );
 });
 
 /**
  * POST /auth/login
- * Authenticates user credentials with rate-limiting.
+ * Layered rate-limiting, generic error messages, constant-time verification.
  */
 authRouter.post('/login', async (c) => {
+  const ip = c.req.header('CF-Connecting-IP') || c.req.header('x-forwarded-for') || '127.0.0.1';
   const body = await c.req.json().catch(() => null);
+
   if (!body) {
     return c.json({ success: false, error: { code: 'BAD_REQUEST', message: 'Invalid JSON body' } }, 400);
   }
 
   const { email, password } = body;
-  const ip = c.req.header('CF-Connecting-IP') || c.req.header('x-forwarded-for') || '127.0.0.1';
-
   if (!email || !password) {
-    return c.json({ success: false, error: { code: 'INVALID_CREDENTIALS', message: 'Email and password are required.' } }, 400);
+    return c.json({ success: false, error: { code: 'INVALID_CREDENTIALS', message: 'Invalid email or password.' } }, 401);
   }
 
   const normEmail = email.toLowerCase().trim();
 
-  // Check brute force rate limit
+  // 1. Layered rate limit check (IP & Account)
   const rateLimit = await checkRateLimit(c.env.DB, ip, normEmail);
   if (!rateLimit.allowed) {
     return c.json(
@@ -125,35 +127,38 @@ authRouter.post('/login', async (c) => {
         success: false,
         error: {
           code: 'RATE_LIMITED',
-          message: `Too many failed login attempts. Please try again in ${rateLimit.retryAfterSeconds} seconds.`,
+          message: `Too many login attempts. Please try again in ${rateLimit.retryAfterSeconds} seconds.`,
         },
       },
       429
     );
   }
 
-  // Fetch user
+  // 2. Fetch user
   const user = await c.env.DB
-    .prepare('SELECT id, email, password_hash, salt, name FROM users WHERE email = ? LIMIT 1')
+    .prepare('SELECT id, email, password_hash, salt, name, hash_iterations FROM users WHERE email = ? LIMIT 1')
     .bind(normEmail)
-    .first<{ id: string; email: string; password_hash: string; salt: string; name: string }>();
+    .first<{ id: string; email: string; password_hash: string; salt: string; name: string; hash_iterations?: number }>();
 
   if (!user) {
     await recordFailedLogin(c.env.DB, ip, normEmail);
+    // Generic authentication error prevents account enumeration
     return c.json({ success: false, error: { code: 'INVALID_CREDENTIALS', message: 'Invalid email or password.' } }, 401);
   }
 
-  // Verify password with constant-time comparison
-  const isValid = await verifyPassword(password, user.password_hash, user.salt);
+  // 3. Verify password
+  const iterations = user.hash_iterations || 100000;
+  const isValid = await verifyPassword(password, user.password_hash, user.salt, iterations);
+
   if (!isValid) {
     await recordFailedLogin(c.env.DB, ip, normEmail);
     return c.json({ success: false, error: { code: 'INVALID_CREDENTIALS', message: 'Invalid email or password.' } }, 401);
   }
 
-  // Clear failed attempts upon success
-  await clearLoginAttempts(c.env.DB, ip, normEmail);
+  // 4. Success: clear failed attempts
+  await clearAccountFailures(c.env.DB, normEmail);
 
-  // Issue session
+  // 5. Issue session
   const session = await createSession(c.env.DB, user.id);
   const isProd = c.env.ENVIRONMENT === 'production';
   const cookie = buildSessionCookie(session.token, session.expiresAt, isProd);
@@ -175,7 +180,7 @@ authRouter.post('/login', async (c) => {
 
 /**
  * POST /auth/logout
- * Revokes the current session and clears the cookie.
+ * Revokes current session and clears cookie.
  */
 authRouter.post('/logout', async (c) => {
   let token: string | undefined;
@@ -212,7 +217,7 @@ authRouter.post('/logout', async (c) => {
 
 /**
  * GET /auth/me
- * Returns current authenticated user details.
+ * Returns current authenticated user.
  */
 authRouter.get('/me', requireAuth, async (c) => {
   const user = c.get('user');

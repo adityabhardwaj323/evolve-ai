@@ -1,6 +1,7 @@
 import { Hono } from 'hono';
 import { cors } from 'hono/cors';
 import { logger } from 'hono/logger';
+import { verifyCsrfAndOrigin } from './middleware/csrf';
 import { authRouter } from './auth/routes';
 import { providersRouter } from './routes/providers';
 import { conversationsRouter } from './routes/conversations';
@@ -51,6 +52,9 @@ app.use('*', async (c, next) => {
   c.header('X-XSS-Protection', '1; mode=block');
   c.header('Referrer-Policy', 'strict-origin-when-cross-origin');
 });
+
+// CSRF & Origin protection middleware for state-changing endpoints
+app.use('*', verifyCsrfAndOrigin);
 
 // Health check endpoint
 app.get('/health', (c) => {

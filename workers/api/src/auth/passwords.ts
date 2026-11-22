@@ -1,30 +1,75 @@
 /**
  * Web Crypto Password Hashing Service
  * 
- * Uses PBKDF2 with SHA-256 and 100,000 iterations.
- * Engineered for native Web Crypto running within Cloudflare Workers Free CPU budget (10ms).
- * Unique 16-byte cryptographically secure salt generated per user.
+ * - Algorithm: PBKDF2 with HMAC-SHA-256.
+ * - Iterations: 100,000 (default, balance of security and Cloudflare Workers 10ms CPU limit).
+ * - Unicode NFKC normalization for passwords before hashing.
+ * - Minimum 12 characters, up to 128 characters.
+ * - Stores algorithm and iteration count metadata to support future seamless upgrades.
+ * - Constant-time comparison for verification.
  */
 
-const PBKDF2_ITERATIONS = 100000;
+export const DEFAULT_PBKDF2_ITERATIONS = 100000;
+export const HASH_ALGORITHM_IDENTIFIER = 'PBKDF2-HMAC-SHA256';
 const SALT_BYTES = 16;
 const KEY_BYTES = 32; // 256-bit derived key
 
 export interface HashResult {
-  hash: string; // hex encoded
-  salt: string; // hex encoded
+  hash: string;       // hex encoded
+  salt: string;       // hex encoded
+  algorithm: string;  // e.g. 'PBKDF2-HMAC-SHA256'
+  iterations: number; // e.g. 100000
 }
 
-export async function hashPassword(password: string): Promise<HashResult> {
-  if (!password || password.length < 8) {
-    throw new Error('Password must be at least 8 characters long.');
+/**
+ * Normalizes a password string using Unicode NFKC normalization.
+ */
+export function normalizePassword(password: string): string {
+  if (typeof password !== 'string') {
+    throw new Error('Password must be a string.');
+  }
+  return password.normalize('NFKC');
+}
+
+/**
+ * Validates password rules:
+ * - Minimum 12 characters.
+ * - Maximum 128 characters.
+ * - No arbitrary mandatory character class constraints (avoids user frustration and encourages long passphrases).
+ */
+export function validatePassword(password: string): { valid: boolean; error?: string } {
+  if (!password || typeof password !== 'string') {
+    return { valid: false, error: 'Password is required.' };
+  }
+  const normalized = normalizePassword(password);
+  if (normalized.length < 12) {
+    return { valid: false, error: 'Password must be at least 12 characters long.' };
+  }
+  if (normalized.length > 128) {
+    return { valid: false, error: 'Password must not exceed 128 characters.' };
+  }
+  return { valid: true };
+}
+
+/**
+ * Hashes a password using PBKDF2-HMAC-SHA256 with cryptographically random salt and iteration count.
+ */
+export async function hashPassword(
+  password: string,
+  iterations: number = DEFAULT_PBKDF2_ITERATIONS
+): Promise<HashResult> {
+  const validation = validatePassword(password);
+  if (!validation.valid) {
+    throw new Error(validation.error);
   }
 
+  const normalized = normalizePassword(password);
   const saltBytes = crypto.getRandomValues(new Uint8Array(SALT_BYTES));
   const enc = new TextEncoder();
+
   const passwordKey = await crypto.subtle.importKey(
     'raw',
-    enc.encode(password),
+    enc.encode(normalized),
     { name: 'PBKDF2' },
     false,
     ['deriveBits']
@@ -34,7 +79,7 @@ export async function hashPassword(password: string): Promise<HashResult> {
     {
       name: 'PBKDF2',
       salt: saltBytes,
-      iterations: PBKDF2_ITERATIONS,
+      iterations,
       hash: 'SHA-256',
     },
     passwordKey,
@@ -44,21 +89,32 @@ export async function hashPassword(password: string): Promise<HashResult> {
   return {
     hash: uint8ArrayToHex(new Uint8Array(derivedBits)),
     salt: uint8ArrayToHex(saltBytes),
+    algorithm: HASH_ALGORITHM_IDENTIFIER,
+    iterations,
   };
 }
 
-export async function verifyPassword(password: string, storedHash: string, storedSalt: string): Promise<boolean> {
+/**
+ * Verifies a password against a stored hash, salt, and iteration count.
+ */
+export async function verifyPassword(
+  password: string,
+  storedHash: string,
+  storedSalt: string,
+  iterations: number = DEFAULT_PBKDF2_ITERATIONS
+): Promise<boolean> {
   if (!password || !storedHash || !storedSalt) {
     return false;
   }
 
-  const saltBytes = hexToUint8Array(storedSalt);
-  const enc = new TextEncoder();
-
   try {
+    const normalized = normalizePassword(password);
+    const saltBytes = hexToUint8Array(storedSalt);
+    const enc = new TextEncoder();
+
     const passwordKey = await crypto.subtle.importKey(
       'raw',
-      enc.encode(password),
+      enc.encode(normalized),
       { name: 'PBKDF2' },
       false,
       ['deriveBits']
@@ -68,7 +124,7 @@ export async function verifyPassword(password: string, storedHash: string, store
       {
         name: 'PBKDF2',
         salt: saltBytes,
-        iterations: PBKDF2_ITERATIONS,
+        iterations,
         hash: 'SHA-256',
       },
       passwordKey,
@@ -82,6 +138,9 @@ export async function verifyPassword(password: string, storedHash: string, store
   }
 }
 
+/**
+ * Constant-time string equality check to mitigate timing attacks.
+ */
 function constantTimeCompare(a: string, b: string): boolean {
   if (a.length !== b.length) {
     return false;

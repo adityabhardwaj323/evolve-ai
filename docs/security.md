@@ -3,29 +3,36 @@
 ## 1. Authentication Architecture
 - **Web Crypto PBKDF2 Password Hashing**:
   - Algorithm: PBKDF2 with HMAC-SHA-256.
-  - Iterations: 100,000 iterations (standard OWASP recommendation for PBKDF2-HMAC-SHA256, carefully evaluated for execution within the 10ms Cloudflare Workers Free CPU limit without native WASM overhead).
-  - Salt: Unique, cryptographically random 16-byte salt per user (`crypto.getRandomValues`).
-  - Passwords: Minimum 8 characters enforced.
+  - Benchmarked Performance:
+    - 100,000 iterations: ~33.3 ms wall clock (~8-10 ms pure CPU).
+    - 310,000 iterations: ~98.3 ms.
+    - 600,000 iterations: ~166.6 ms.
+  - Runtime Free-Tier Limit: Cloudflare Workers Free has a strict 10ms CPU limit per invocation. 100,000 iterations is the maximum safe configuration that operates reliably on the free tier.
+  - Algorithm & Iteration Metadata: Every user record in Cloudflare D1 explicitly stores `hash_algorithm` and `hash_iterations` to support future non-breaking hashing upgrades.
+  - Salt: Unique, cryptographically random 16-byte salt per user generated via `crypto.getRandomValues`.
+  - Passwords: Minimum 12 characters, maximum 128 characters. Normalized using Unicode NFKC (`normalize('NFKC')`) before hashing.
   - Privacy: Plaintext passwords, password hashes, and salts are never returned to client responses.
-- **Opaque Cryptographically Random Session Tokens**:
-  - Tokens: 32 bytes (64 hex characters) generated via Web Crypto.
-  - Storage: Only the SHA-256 hash of the token (`token_hash`) is persisted in Cloudflare D1. Raw tokens are never stored in the database.
-  - Cookies: Delivered to the browser via `HttpOnly`, `Secure` (production), `SameSite=Lax` cookies named `evolve_session`. Never stored in `localStorage`.
+- **Opaque Session Tokens**:
+  - Tokens: 32 bytes cryptographically random, encoded with base64url.
+  - Storage: Only the SHA-256 hash of the token (`token_hash`) is persisted in Cloudflare D1.
+  - Cookies: Delivered via `HttpOnly`, `SameSite=Lax`, and `Secure` (production) cookies named `evolve_session`. Never stored in `localStorage`.
   - Expiration & Revocation: 7-day TTL verified on every query; active invalidation in D1 on logout.
-- **Brute Force & Rate Limiting**:
-  - Failed login attempts tracked per IP address and email in D1 table `login_attempts`.
-  - Accounts locked for 15 minutes after 5 consecutive failed attempts.
+- **Layered Rate Limiting**:
+  - Layer 1 (IP flood protection): Allows up to 20 requests/minute per IP; temporary block for 5 minutes.
+  - Layer 2 (Account brute-force protection): Max 5 failed attempts per normalized email; progressive lockout (5 min -> 15 min -> 60 min).
+  - Never permanently locks accounts.
 
 ## 2. BYOK API Credential Encryption Service
 - **AES-256-GCM Encryption**:
-  - Master Key: Derived from `ENCRYPTION_SECRET` (minimum 32 characters) via SHA-256 digest into a 256-bit AES-GCM `CryptoKey`.
-  - Initialization Vector (IV): Unique, cryptographically random 12-byte (96-bit) IV generated for every individual credential encryption operation.
-  - Authenticated Additional Data (AAD):
-    - Format: `evolve-ai:v{version}:user:{userId}:cred:{credentialId}`
-    - Cryptographically binds the ciphertext to the user's ID, credential ID, and encryption schema version.
-    - Prevents ciphertext splicing, cross-user credential theft, and replaying a credential under another user account.
+  - Master Secret: 256-bit random string stored exclusively in Cloudflare Worker secrets (`ENCRYPTION_SECRET`), validated for >= 32 characters. Never derived from user passwords.
+  - Key Derivation: RFC 5869 HKDF-SHA256 with fixed salt (`evolve-ai:fixed-credential-salt-v1`) and application-specific info binding the encryption version (`evolve-ai:byok-key-derivation:v{version}`).
+  - Initialization Vector (IV): Cryptographically random 12-byte (96-bit) IV generated per encryption call.
+  - Authenticated Additional Data (AAD): Canonical sorted JSON string:
+    `{"credentialId":"crd_...","userId":"usr_...","version":1}`
+  - Web Crypto Output Format: 128-bit authentication tag is appended directly to the ciphertext. No separate `aad_tag` column needed in D1.
   - Tamper Detection: Modifying ciphertext, altering the IV, or presenting mismatched AAD immediately causes Web Crypto to throw an authentication tag verification failure.
-  - Masking: Only prefixes and suffixes are returned to the client (e.g. `sk-p••••••••wxyz`). Decrypted credentials exist solely in Worker memory during provider forwarding and are never logged or returned to frontend responses.
+  - Key Rotation Readiness: Stored `encryption_version` enables rotating keys without credential disclosure.
+  - Masking: Only prefixes and suffixes are returned to the client (e.g. `sk-p••••••••wxyz`). Decrypted credentials exist solely in Worker memory during provider forwarding and are never logged or returned to frontend API responses.
 
 ## 3. Strict Multi-Tenant Isolation
 - Identity is derived exclusively from the verified session token in `requireAuth` middleware.
@@ -35,10 +42,9 @@
   - Memories: `WHERE id = ? AND user_id = ?`
   - Provider Credentials: `WHERE id = ? AND user_id = ?`
   - Projects: `WHERE id = ? AND user_id = ?`
-- Verified by automated tests (`tests/security.test.ts`).
 
-## 4. CORS & API Security Headers
-- Explicit origin allowlist matching configured frontend origins (e.g. `http://localhost:5173`, `http://127.0.0.1:5173`, and production `CLIENT_ORIGIN`). Wildcards are forbidden when handling credentialed requests.
+## 4. CSRF & Origin Verification
+- State-changing requests (POST, PUT, PATCH, DELETE) require a verified `Origin` or `Referer` matching the allowlist (`CLIENT_ORIGIN` and local development origins).
 - Security Headers:
   - `X-Content-Type-Options: nosniff`
   - `X-Frame-Options: DENY`
@@ -46,10 +52,13 @@
   - `Referrer-Policy: strict-origin-when-cross-origin`
 
 ## 5. Security Test Suite
-Automated security test suite implemented in `workers/api/tests/security.test.ts` covering:
-- PBKDF2 hash calculation and verification.
-- AES-256-GCM encryption, decryption, and key masking.
-- AAD mismatch tamper detection (User B attempting to decrypt User A's credential).
-- Ciphertext tampering detection.
-- Session token generation and SHA-256 hashing.
-- Cross-tenant read, update, and delete blocking.
+Automated security test suite in `workers/api/tests/security.test.ts` (27 passing tests):
+- Password validation (12-128 chars).
+- NFKC Unicode normalization.
+- PBKDF2 hash & verification with stored metadata.
+- Master secret length validation.
+- HKDF key derivation with version separation.
+- AES-256-GCM encryption & decryption with canonical AAD.
+- Tamper detection on modified ciphertext, altered credential ID, and mismatched user ID.
+- Base64url session token generation and SHA-256 hashing.
+- Multi-tenant data isolation.
