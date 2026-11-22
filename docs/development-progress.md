@@ -13,16 +13,35 @@
 - [x] Project documentation suite (`architecture.md`, `database-schema.md`, `security.md`, `setup.md`).
 - [x] Dependencies installation & build verification (all packages compile & typecheck with 0 errors).
 
-### Milestone 2: Authentication & Security
+### Milestone 2 & 2.1: Authentication, Security Hardening & Tenant Isolation
 - [x] Web Crypto PBKDF2 password hashing (HMAC-SHA-256, 100,000 iterations, 16-byte random salt).
-- [x] Opaque cryptographically random session tokens (32 bytes) with SHA-256 hash storage in D1.
-- [x] HttpOnly, Secure, SameSite=Lax session cookies (`evolve_session`).
+  - Explicitly benchmarked and documented as a deployment-constrained compromise for the 10ms Cloudflare Free CPU limit.
+  - Per-user `hash_algorithm` and `hash_iterations` stored in D1 to support future upgrades.
+  - Unicode NFKC normalization and 12-128 character password validation.
+- [x] Opaque cryptographically random session tokens (32 bytes) encoded with RFC 4648 base64url.
+  - Only SHA-256 hash stored in D1 (`token_hash`).
+  - HttpOnly, SameSite=Lax, and Secure (in production) cookies (`evolve_session`).
 - [x] Authentication & Authorization routes (`/auth/register`, `/auth/login`, `/auth/logout`, `/auth/me`).
-- [x] Brute force login protection & rate limiting (`login_attempts` table).
-- [x] BYOK AES-256-GCM encryption service (`workers/api/src/security/crypto.ts`) with unique 12-byte IV per operation and AAD binding (`userId`, `credentialId`, `version`).
-- [x] Strict tenant isolation enforced on every D1 query across conversations, memories, projects, and credentials.
-- [x] Automated test suite verifying password verification, credential encryption, tamper detection, and cross-user data isolation (`20 passed, 0 failed`).
-- [x] Updated D1 migration schema (`0002_security_and_credentials.sql`).
+  - Session rotation on login.
+  - Complete invalidation and cookie clearing on logout.
+- [x] Layered rate limiting & DoS defense:
+  - Trusting only Cloudflare-provided `CF-Connecting-IP`.
+  - IP-based rate limiting (flood protection).
+  - Account-based rate limiting with progressive lockout capped at 30 minutes to prevent malicious denial-of-service against third-party accounts.
+- [x] BYOK AES-256-GCM encryption service:
+  - Strict master secret entropy validation (requires exactly 32 bytes via 64-char hex or 44-char base64).
+  - RFC 5869 HKDF-SHA256 key derivation with fixed salt and versioned info.
+  - Canonical sorted JSON AAD binding (`userId`, `credentialId`, `version`).
+  - Native Web Crypto tag appending without redundant database columns.
+  - Key rotation helper preserving access to existing records without plaintext exposure.
+- [x] HTTP Security Headers & CSRF:
+  - Strict Content Security Policy (CSP), `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Permissions-Policy`.
+  - Removed legacy `X-XSS-Protection`.
+  - CSRF middleware enforcing origin verification and rejecting unauthenticated cross-site requests.
+- [x] Full Automated Security & Integration Test Suites:
+  - 27 unit security tests (`tsx tests/security.test.ts`).
+  - 9 end-to-end integration tests (`vitest run tests/integration.test.ts`).
+  - Verified Alice cannot read, delete, or decrypt Bob's data through actual API routes.
 
 ### Milestone 3: Multi-Provider Integration (BYOK)
 - [ ] Google Gemini Adapter.

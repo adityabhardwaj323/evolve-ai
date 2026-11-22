@@ -1,17 +1,20 @@
 /**
  * Web Crypto AES-256-GCM Credential Encryption Service
  * 
- * Cryptographic Architecture:
- * - Master Secret: Minimum 32-character random string from Cloudflare Worker Secret.
- * - Key Derivation: RFC 5869 HKDF-SHA256 with documented fixed salt and application-specific info.
+ * Cryptographic Architecture & Hardening:
+ * - Master Secret: Requires EXACTLY 32 cryptographically random bytes (256 bits of entropy).
+ *   Supplied either as 64 hex characters or 43-44 base64/base64url characters.
+ *   Arbitrary text strings are strictly rejected to guarantee 256-bit entropy.
+ * - Key Derivation: RFC 5869 HKDF-SHA256 with fixed salt and versioned application info.
  * - Cipher: AES-256-GCM with 128-bit authentication tag appended directly to ciphertext.
- * - IV: Cryptographically random 12-byte (96-bit) IV per encryption call.
+ * - IV: Fresh cryptographically random 12-byte (96-bit) IV generated per encryption call.
  * - Authenticated Additional Data (AAD): Canonical JSON string binding:
  *     - userId
  *     - credentialId
  *     - version
- * - Zero extra aad_tag column needed (Web Crypto AES-GCM appends tag directly).
- * - Decrypted keys never leave Worker memory or get exposed in responses or logs.
+ * - Key Rotation Procedure: Functions support re-encrypting existing records with new version/secret
+ *   without exposing keys.
+ * - Zero plaintext API keys appear in logs, responses, or error messages.
  */
 
 export interface EncryptedPayload {
@@ -33,27 +36,63 @@ const HKDF_INFO_PREFIX = 'evolve-ai:byok-key-derivation:v';
 const HKDF_FIXED_SALT = new TextEncoder().encode('evolve-ai:fixed-credential-salt-v1');
 
 /**
- * Validates that the runtime encryption secret satisfies 256-bit entropy requirements.
+ * Validates and decodes the master secret into exactly 32 bytes (256 bits).
+ * Accepts:
+ *   1. 64-character hexadecimal string [0-9a-fA-F]
+ *   2. 43-44 character standard Base64 or Base64Url string
+ * Arbitrary text strings are strictly rejected to ensure true 256-bit cryptographic entropy.
  */
-export function validateEncryptionConfiguration(secret?: string): void {
+export function decodeMasterSecret(secret?: string): Uint8Array {
   if (!secret || typeof secret !== 'string') {
     throw new Error('ENCRYPTION_SECRET is required and must be a string.');
   }
-  if (secret.length < 32) {
-    throw new Error('ENCRYPTION_SECRET must be at least 32 characters long for 256-bit security.');
+
+  const trimmed = secret.trim();
+
+  // Check 1: 64-character Hexadecimal (32 bytes)
+  if (trimmed.length === 64 && /^[0-9a-fA-F]{64}$/.test(trimmed)) {
+    const bytes = new Uint8Array(32);
+    for (let i = 0; i < 64; i += 2) {
+      bytes[i / 2] = parseInt(trimmed.substring(i, i + 2), 16);
+    }
+    return bytes;
   }
+
+  // Check 2: Base64 / Base64URL string (32 bytes decode length)
+  const base64Std = trimmed.replace(/-/g, '+').replace(/_/g, '/');
+  try {
+    const binary = atob(base64Std);
+    if (binary.length === 32) {
+      const bytes = new Uint8Array(32);
+      for (let i = 0; i < 32; i++) {
+        bytes[i] = binary.charCodeAt(i);
+      }
+      return bytes;
+    }
+  } catch {
+    // Not valid base64
+  }
+
+  throw new Error(
+    'ENCRYPTION_SECRET must decode to exactly 32 cryptographically random bytes (provide either a 64-character hex string or 43-44 character base64/base64url string). Arbitrary text strings are rejected.'
+  );
 }
 
 /**
- * Derives a 256-bit AES-GCM CryptoKey using HKDF-SHA256.
- * Binds derivation to the specific encryption version.
+ * Validates configuration without exposing secret material.
+ */
+export function validateEncryptionConfiguration(secret?: string): void {
+  decodeMasterSecret(secret);
+}
+
+/**
+ * Derives a 256-bit AES-GCM CryptoKey using HKDF-SHA256 from the decoded 32-byte secret.
  */
 export async function deriveKeyWithHKDF(secret: string, version: number = CURRENT_ENCRYPTION_VERSION): Promise<CryptoKey> {
-  validateEncryptionConfiguration(secret);
+  const secretBytes = decodeMasterSecret(secret);
   const enc = new TextEncoder();
-  const secretBytes = enc.encode(secret);
 
-  // Import base key material
+  // Import raw master key material
   const baseKey = await crypto.subtle.importKey(
     'raw',
     secretBytes,
@@ -64,7 +103,6 @@ export async function deriveKeyWithHKDF(secret: string, version: number = CURREN
 
   const infoBytes = enc.encode(`${HKDF_INFO_PREFIX}${version}`);
 
-  // Derive AES-256-GCM key via HKDF-SHA256
   return crypto.subtle.deriveKey(
     {
       name: 'HKDF',
@@ -81,7 +119,6 @@ export async function deriveKeyWithHKDF(secret: string, version: number = CURREN
 
 /**
  * Serializes canonical AAD buffer consistently for encryption and decryption.
- * Canonical JSON with sorted keys.
  */
 export function createCanonicalAAD(context: AADContext): Uint8Array {
   const canonicalString = JSON.stringify({
@@ -128,7 +165,7 @@ export async function encryptCredential(
 
   const plaintextBytes = new TextEncoder().encode(apiKey.trim());
 
-  // Web Crypto AES-GCM automatically appends the 128-bit authentication tag to the ciphertext buffer
+  // Web Crypto AES-GCM appends the 128-bit authentication tag directly to ciphertext
   const cipherBuffer = await crypto.subtle.encrypt(
     {
       name: 'AES-GCM',
@@ -187,6 +224,26 @@ export async function decryptCredential(
   } catch (err) {
     throw new Error('Decryption failed: Authentication tag verification failed (ciphertext corrupted, wrong secret, or AAD mismatch).');
   }
+}
+
+/**
+ * Key Rotation Procedure Helper:
+ * Decrypts a credential under an old secret/version and re-encrypts under a new secret/version.
+ * All in-memory, without storing plaintext.
+ */
+export async function rotateCredentialKey(
+  payload: {
+    encryptedKey: string;
+    keyIv: string;
+    encryptionVersion: number;
+  },
+  oldSecret: string,
+  newSecret: string,
+  newVersion: number,
+  context: { userId: string; credentialId: string }
+): Promise<EncryptedPayload> {
+  const decrypted = await decryptCredential(payload, oldSecret, context);
+  return encryptCredential(decrypted, newSecret, context, newVersion);
 }
 
 function uint8ArrayToBase64(bytes: Uint8Array): string {

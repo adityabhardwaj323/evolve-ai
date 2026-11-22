@@ -14,7 +14,7 @@
     "build": "npm run build --workspace=@evolve-ai/shared-types && npm run build --workspace=@evolve-ai/provider-sdk && npm run build --workspace=@evolve-ai/memory-engine && npm run build --workspace=apps/web",
     "lint": "npm run lint --workspaces --if-present",
     "typecheck": "npm run typecheck --workspaces --if-present",
-    "test": "npm run test:security --workspace=workers/api"
+    "test": "npm run test --workspace=workers/api"
   },
   "keywords": [
     "ai",
@@ -28,6 +28,7 @@
   "author": "EvolveAI Team",
   "license": "MIT",
   "devDependencies": {
-    "tsx": "^4.23.15"
+    "tsx": "^4.23.15",
+    "vitest": "^5.1.1"
   }
 }

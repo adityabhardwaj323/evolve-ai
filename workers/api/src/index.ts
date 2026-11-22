@@ -44,13 +44,28 @@ app.use('*', async (c, next) => {
   return corsMiddleware(c, next);
 });
 
-// Security response headers middleware
+// Modern Security response headers middleware
 app.use('*', async (c, next) => {
   await next();
+  // 1. Content Security Policy for React/Vite SPA
+  const csp = [
+    "default-src 'self'",
+    "script-src 'self'",
+    "style-src 'self' 'unsafe-inline'", // required for Tailwind / inline theme styles
+    "img-src 'self' data: https:",
+    "font-src 'self' data:",
+    "connect-src 'self' http://localhost:5173 http://localhost:8787 " + (c.env.CLIENT_ORIGIN || ''),
+    "frame-ancestors 'none'",
+    "base-uri 'self'",
+    "form-action 'self'",
+  ].join('; ');
+
+  c.header('Content-Security-Policy', csp);
   c.header('X-Content-Type-Options', 'nosniff');
   c.header('X-Frame-Options', 'DENY');
-  c.header('X-XSS-Protection', '1; mode=block');
   c.header('Referrer-Policy', 'strict-origin-when-cross-origin');
+  c.header('Permissions-Policy', 'camera=(), microphone=(), geolocation=(), payment=()');
+  // Note: Legacy X-XSS-Protection header deliberately omitted as per modern web standards
 });
 
 // CSRF & Origin protection middleware for state-changing endpoints

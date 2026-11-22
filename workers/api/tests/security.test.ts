@@ -85,16 +85,16 @@ async function runSecurityTestSuite() {
     }
     assert(rejected, 'Master encryption secret rejected if shorter than 32 characters');
 
-    const validSecret = 'super_secret_master_encryption_key_256_bits!';
+    const validSecret = '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef';
     validateEncryptionConfiguration(validSecret);
-    assert(true, 'Master encryption secret validated successfully for >= 32 characters');
+    assert(true, 'Master encryption secret validated successfully for 64-char hex 256-bit entropy');
   } catch (err) {
     console.error('Test 2 error:', err);
     failed++;
   }
 
   // --- TEST 3: HKDF Key Derivation ---
-  const MASTER_SECRET = 'sample_master_secret_for_hkdf_test_minimum_32_bytes_long';
+  const MASTER_SECRET = '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef';
   try {
     const keyV1 = await deriveKeyWithHKDF(MASTER_SECRET, 1);
     const keyV2 = await deriveKeyWithHKDF(MASTER_SECRET, 2);

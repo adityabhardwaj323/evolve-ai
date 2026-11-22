@@ -7,7 +7,9 @@
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
     "typecheck": "tsc --noEmit",
-    "test:security": "tsx tests/security.test.ts"
+    "test:security": "tsx tests/security.test.ts",
+    "test:integration": "vitest run tests/integration.test.ts",
+    "test": "npm run test:security && npm run test:integration"
   },
   "dependencies": {
     "@evolve-ai/memory-engine": "*",

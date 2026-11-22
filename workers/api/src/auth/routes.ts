@@ -8,7 +8,13 @@ import {
   buildClearSessionCookie,
   SESSION_COOKIE_NAME,
 } from './sessions';
-import { checkRateLimit, recordFailedLogin, clearAccountFailures, recordIpRequest } from './rate-limit';
+import {
+  checkRateLimit,
+  recordFailedLogin,
+  clearAccountFailures,
+  recordIpRequest,
+  getTrustedClientIp,
+} from './rate-limit';
 import { requireAuth, AuthContext } from '../middleware/auth';
 
 export const authRouter = new Hono<{ Bindings: Env; Variables: AuthContext }>();
@@ -19,10 +25,10 @@ function isValidEmail(email: string): boolean {
 
 /**
  * POST /auth/register
- * Registers a new user with minimum 12-char normalized password and stored iteration metadata.
+ * Registers a new user.
  */
 authRouter.post('/register', async (c) => {
-  const ip = c.req.header('CF-Connecting-IP') || c.req.header('x-forwarded-for') || '127.0.0.1';
+  const ip = getTrustedClientIp(c.req.raw.headers);
   await recordIpRequest(c.env.DB, ip);
 
   const body = await c.req.json().catch(() => null);
@@ -77,7 +83,7 @@ authRouter.post('/register', async (c) => {
     .bind(crypto.randomUUID(), userId)
     .run();
 
-  // Automatically create session
+  // Automatically create fresh session
   const session = await createSession(c.env.DB, userId);
   const isProd = c.env.ENVIRONMENT === 'production';
   const cookie = buildSessionCookie(session.token, session.expiresAt, isProd);
@@ -102,10 +108,10 @@ authRouter.post('/register', async (c) => {
 
 /**
  * POST /auth/login
- * Layered rate-limiting, generic error messages, constant-time verification.
+ * Authenticates user credentials with rate-limiting and session rotation.
  */
 authRouter.post('/login', async (c) => {
-  const ip = c.req.header('CF-Connecting-IP') || c.req.header('x-forwarded-for') || '127.0.0.1';
+  const ip = getTrustedClientIp(c.req.raw.headers);
   const body = await c.req.json().catch(() => null);
 
   if (!body) {
@@ -119,7 +125,7 @@ authRouter.post('/login', async (c) => {
 
   const normEmail = email.toLowerCase().trim();
 
-  // 1. Layered rate limit check (IP & Account)
+  // 1. Layered rate limit check
   const rateLimit = await checkRateLimit(c.env.DB, ip, normEmail);
   if (!rateLimit.allowed) {
     return c.json(
@@ -142,7 +148,7 @@ authRouter.post('/login', async (c) => {
 
   if (!user) {
     await recordFailedLogin(c.env.DB, ip, normEmail);
-    // Generic authentication error prevents account enumeration
+    // Generic error message prevents account enumeration
     return c.json({ success: false, error: { code: 'INVALID_CREDENTIALS', message: 'Invalid email or password.' } }, 401);
   }
 
@@ -155,10 +161,10 @@ authRouter.post('/login', async (c) => {
     return c.json({ success: false, error: { code: 'INVALID_CREDENTIALS', message: 'Invalid email or password.' } }, 401);
   }
 
-  // 4. Success: clear failed attempts
+  // 4. Success: reset failure counters
   await clearAccountFailures(c.env.DB, normEmail);
 
-  // 5. Issue session
+  // 5. Session rotation: issue a fresh session token
   const session = await createSession(c.env.DB, user.id);
   const isProd = c.env.ENVIRONMENT === 'production';
   const cookie = buildSessionCookie(session.token, session.expiresAt, isProd);
@@ -180,7 +186,7 @@ authRouter.post('/login', async (c) => {
 
 /**
  * POST /auth/logout
- * Revokes current session and clears cookie.
+ * Revokes the session in D1 and clears the cookie.
  */
 authRouter.post('/logout', async (c) => {
   let token: string | undefined;
@@ -217,7 +223,7 @@ authRouter.post('/logout', async (c) => {
 
 /**
  * GET /auth/me
- * Returns current authenticated user.
+ * Returns current authenticated user. Rejects revoked, expired, or invalid sessions.
  */
 authRouter.get('/me', requireAuth, async (c) => {
   const user = c.get('user');
