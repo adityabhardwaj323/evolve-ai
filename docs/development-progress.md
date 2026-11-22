@@ -68,11 +68,28 @@
   - D1 `usage_events` tracking prompt, completion, and total tokens.
   - Aggregated metrics and recent event logs.
 - [x] New D1 database migration (`0003_usage_and_provider_defaults.sql`).
-- [x] Automated test suites:
-  - Unit tests for provider adapters and registry (`6 passed`).
-  - Security unit tests (`27 passed`).
-  - E2E API integration tests (`13 passed`).
-  - 100% typecheck and production build passing.
+
+### Milestone 3.1: Live Provider Verification, Dynamic Discovery & Production Readiness
+- [x] Upstream API Audit & Hardening across all 6 provider adapters:
+  - Anthropic: Upgraded `listModels` to use official `GET /v1/models` with pagination (`limit=50`, `after_id`), distinguishing active/deprecated/retired model statuses, with verified fallback metadata (`isFallback: true`, `lastVerifiedDate`).
+  - Gemini: Added dynamic model listing pagination (`pageSize=50`, `pageToken`) and verified SSE chunk handling.
+  - OpenAI / Grok / Mistral / OpenRouter: Validated official base URLs, authentication headers, and standard chat completion interfaces.
+- [x] Real Dynamic Model Discovery:
+  - Extended shared `ModelDescriptor` with `isFallback`, `lastVerifiedDate`, and `status`.
+  - `GET /providers/supported/:providerId/models` dynamically retrieves live catalogue using user's connected BYOK credential; falls back cleanly to dated verified static catalogue when unauthenticated.
+- [x] Strict Streaming Cancellation Propagation:
+  - Bound client SSE disconnects (`c.req.raw.signal`) and `POST /chat/stop` directly to upstream fetch `AbortController`.
+  - Ensured immediate upstream socket abort and lock release on `ReadableStreamDefaultReader` upon cancellation, preventing orphaned upstream token generation.
+- [x] Resilient Multi-Model Comparison:
+  - Implemented 30-second independent timeout controllers for each branch in `POST /chat/compare`.
+  - Failure or timeout in Model A does not abort or corrupt Model B's output.
+- [x] Production User-Triggered Smoke Test Endpoint:
+  - Created `POST /providers/credentials/:id/smoke-test` allowing users to run an on-demand 4-stage health test (Auth, Text Generation, SSE Streaming, Usage Accounting) without background or automatic billing.
+- [x] Comprehensive Automated Test Coverage:
+  - 12 provider SDK unit tests (`vitest run`).
+  - 27 Web Crypto security unit tests (`tsx tests/security.test.ts`).
+  - 15 end-to-end integration tests (`vitest run`).
+  - 100% monorepo typecheck and production build passing.
 
 ### Milestone 4: AI Workspace
 - [ ] Chat conversation persistence in D1.

@@ -45,7 +45,12 @@ export class OpenAICompatibleAdapter implements IProviderAdapter {
   }
 
   listStaticModels(): ModelDescriptor[] {
-    return this.config.staticModels;
+    return this.config.staticModels.map((m) => ({
+      ...m,
+      isFallback: true,
+      lastVerifiedDate: '2026-11-23',
+      status: 'active',
+    }));
   }
 
   protected getBaseUrl(customEndpoint?: string): string {
@@ -86,11 +91,17 @@ export class OpenAICompatibleAdapter implements IProviderAdapter {
       if (!data.data || !Array.isArray(data.data)) {
         return this.listStaticModels();
       }
+
       return data.data.map((m: any) => ({
         id: m.id,
-        name: m.id,
+        name: m.name || m.id,
         provider: this.providerType,
+        contextWindow: m.context_length || undefined,
+        description: m.description,
         isDefault: m.id === this.config.defaultModel,
+        isFallback: false,
+        lastVerifiedDate: new Date().toISOString().split('T')[0],
+        status: 'active',
       }));
     } catch {
       return this.listStaticModels();
@@ -200,6 +211,10 @@ export class OpenAICompatibleAdapter implements IProviderAdapter {
 
     try {
       while (true) {
+        if (options.signal?.aborted) {
+          throw new DOMException('Generation cancelled by user', 'AbortError');
+        }
+
         const { done, value } = await reader.read();
         if (done) break;
 

@@ -34,7 +34,7 @@ describe('Milestone 3 — Provider SDK & Adapters Unit Tests', () => {
 
     const claude = registry.get('claude');
     expect(claude.getCapabilities().supportsStreaming).toBe(true);
-    expect(claude.getCapabilities().supportsModelDiscovery).toBe(false); // Anthropic does not have public list endpoint
+    expect(claude.getCapabilities().supportsModelDiscovery).toBe(true); // Anthropic models discovery now supported via /v1/models
   });
 
   it('mock test: Gemini generation parses contents and usage correctly', async () => {

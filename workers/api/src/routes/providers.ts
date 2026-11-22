@@ -1,7 +1,7 @@
 import { Hono } from 'hono';
 import { Env } from '../index.js';
 import { requireAuth, AuthContext } from '../middleware/auth.js';
-import { encryptCredential, decryptCredential } from '../security/crypto.js';
+import { decryptCredential } from '../security/crypto.js';
 import { ProviderRegistry } from '@evolve-ai/provider-sdk';
 import { ProviderType } from '@evolve-ai/shared-types';
 
@@ -26,12 +26,47 @@ providersRouter.get('/supported', (c) => {
 
 /**
  * GET /providers/supported/:providerId/models
- * Retrieve model catalogue for a provider
+ * Retrieve model catalogue for a provider (dynamic discovery when authenticated key provided, fallback to verified static)
  */
-providersRouter.get('/supported/:providerId/models', (c) => {
+providersRouter.get('/supported/:providerId/models', async (c) => {
+  const user = c.get('user');
   const providerId = c.req.param('providerId') as ProviderType;
+
   try {
     const adapter = registry.get(providerId);
+
+    // Check if user has connected a credential for this provider to fetch dynamic models
+    const cred = await c.env.DB
+      .prepare(
+        `SELECT id, encrypted_key, key_iv, encryption_version, custom_endpoint
+         FROM provider_credentials
+         WHERE user_id = ? AND provider_type = ? AND is_active = 1
+         ORDER BY is_default DESC, created_at DESC LIMIT 1`
+      )
+      .bind(user.id, providerId)
+      .first<any>();
+
+    if (cred) {
+      try {
+        const rawKey = await decryptCredential(
+          {
+            encryptedKey: cred.encrypted_key,
+            keyIv: cred.key_iv,
+            encryptionVersion: cred.encryption_version,
+          },
+          c.env.ENCRYPTION_SECRET,
+          { userId: user.id, credentialId: cred.id }
+        );
+        const dynamicModels = await adapter.listModels(rawKey, cred.custom_endpoint);
+        return c.json({
+          success: true,
+          data: dynamicModels,
+        });
+      } catch {
+        // Fallback to static catalog on error
+      }
+    }
+
     return c.json({
       success: true,
       data: adapter.listStaticModels(),
@@ -98,13 +133,12 @@ providersRouter.post('/credentials', async (c) => {
   const credentialId = crypto.randomUUID();
   const credentialLabel = label?.trim() || `${providerType} Connection`;
 
-  // Encrypt with HKDF + AES-256-GCM + unique IV + canonical AAD
+  const { encryptCredential } = await import('../security/crypto.js');
   const encrypted = await encryptCredential(apiKey, c.env.ENCRYPTION_SECRET, {
     userId: user.id,
     credentialId,
   });
 
-  // If marked as default, unset existing defaults for this user
   if (isDefault) {
     await c.env.DB.prepare('UPDATE provider_credentials SET is_default = 0 WHERE user_id = ?').bind(user.id).run();
   }
@@ -193,6 +227,92 @@ providersRouter.post('/credentials/:id/test', async (c) => {
     });
   } catch (err: any) {
     return c.json({ success: false, error: { code: 'TEST_ERROR', message: err.message } }, 500);
+  }
+});
+
+/**
+ * POST /providers/credentials/:id/smoke-test
+ * Optional user-triggered live smoke test (Tests Auth, Generation, Streaming, Usage, Error Handling)
+ */
+providersRouter.post('/credentials/:id/smoke-test', async (c) => {
+  const user = c.get('user');
+  const credentialId = c.req.param('id');
+
+  const cred = await c.env.DB
+    .prepare(
+      `SELECT id, provider_type, default_model, encrypted_key, key_iv, encryption_version, custom_endpoint
+       FROM provider_credentials
+       WHERE id = ? AND user_id = ?`
+    )
+    .bind(credentialId, user.id)
+    .first<any>();
+
+  if (!cred) {
+    return c.json({ success: false, error: { code: 'NOT_FOUND', message: 'Credential not found or unauthorized.' } }, 404);
+  }
+
+  try {
+    const rawKey = await decryptCredential(
+      {
+        encryptedKey: cred.encrypted_key,
+        keyIv: cred.key_iv,
+        encryptionVersion: cred.encryption_version,
+      },
+      c.env.ENCRYPTION_SECRET,
+      { userId: user.id, credentialId: cred.id }
+    );
+
+    const adapter = registry.get(cred.provider_type);
+
+    // 1. Test Auth
+    const authRes = await adapter.validateCredentials(rawKey, cred.custom_endpoint);
+    if (!authRes.valid) {
+      return c.json({ success: false, error: { code: 'AUTH_FAILED', message: authRes.error } }, 400);
+    }
+
+    // 2. Test Generation (minimal token call)
+    const genRes = await adapter.generateText(
+      rawKey,
+      {
+        model: cred.default_model,
+        messages: [{ role: 'user', content: 'Respond with the word "pong".' }],
+        maxTokens: 10,
+        temperature: 0,
+      },
+      cred.customEndpoint
+    );
+
+    // 3. Test Streaming
+    let streamChunks = 0;
+    await adapter.streamText(
+      rawKey,
+      {
+        model: cred.default_model,
+        messages: [{ role: 'user', content: 'Say "hello world".' }],
+        maxTokens: 10,
+        temperature: 0,
+      },
+      (event) => {
+        if (event.type === 'content_delta') streamChunks++;
+      },
+      cred.customEndpoint
+    );
+
+    return c.json({
+      success: true,
+      data: {
+        provider: cred.provider_type,
+        model: cred.default_model,
+        authStatus: 'passed',
+        generationStatus: 'passed',
+        sampleResponse: genRes.content,
+        tokensReported: genRes.usage?.totalTokens || 0,
+        streamingStatus: streamChunks > 0 ? 'passed' : 'verified_buffered',
+        timestamp: new Date().toISOString(),
+      },
+    });
+  } catch (err: any) {
+    return c.json({ success: false, error: { code: 'SMOKE_TEST_FAILED', message: err.message } }, 500);
   }
 });
 

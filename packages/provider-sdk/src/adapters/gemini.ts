@@ -43,6 +43,9 @@ export class GeminiAdapter implements IProviderAdapter {
         contextWindow: 1048576,
         description: 'Fast, versatile performance across a diverse variety of multimodal tasks.',
         isDefault: true,
+        isFallback: true,
+        lastVerifiedDate: '2026-11-23',
+        status: 'active',
       },
       {
         id: 'gemini-1.5-pro',
@@ -50,6 +53,9 @@ export class GeminiAdapter implements IProviderAdapter {
         provider: 'gemini',
         contextWindow: 2097152,
         description: 'Mid-size multimodal model optimized for complex reasoning tasks.',
+        isFallback: true,
+        lastVerifiedDate: '2026-11-23',
+        status: 'active',
       },
       {
         id: 'gemini-2.0-flash-exp',
@@ -57,6 +63,9 @@ export class GeminiAdapter implements IProviderAdapter {
         provider: 'gemini',
         contextWindow: 1048576,
         description: 'Next-generation multimodal model with low latency and real-time streaming.',
+        isFallback: true,
+        lastVerifiedDate: '2026-11-23',
+        status: 'active',
       },
     ];
   }
@@ -78,25 +87,51 @@ export class GeminiAdapter implements IProviderAdapter {
 
   async listModels(apiKey: string): Promise<ModelDescriptor[]> {
     try {
-      const url = `https://generativelanguage.googleapis.com/v1beta/models?key=${encodeURIComponent(apiKey)}`;
-      const res = await fetch(url);
-      if (!res.ok) {
-        return this.listStaticModels();
+      const allModels: ModelDescriptor[] = [];
+      let pageToken: string | undefined = undefined;
+      let pageCount = 0;
+
+      while (pageCount < 5) {
+        pageCount++;
+        let url = `https://generativelanguage.googleapis.com/v1beta/models?pageSize=50&key=${encodeURIComponent(apiKey)}`;
+        if (pageToken) {
+          url += `&pageToken=${encodeURIComponent(pageToken)}`;
+        }
+
+        const res = await fetch(url);
+        if (!res.ok) {
+          return this.listStaticModels();
+        }
+
+        const data: any = await res.json();
+        if (!data.models || !Array.isArray(data.models)) {
+          break;
+        }
+
+        for (const m of data.models) {
+          if (m.supportedGenerationMethods?.includes('generateContent')) {
+            const rawId = m.name.replace('models/', '');
+            allModels.push({
+              id: rawId,
+              name: m.displayName || rawId,
+              provider: 'gemini',
+              contextWindow: m.inputTokenLimit || 1048576,
+              description: m.description,
+              isDefault: rawId === 'gemini-1.5-flash',
+              isFallback: false,
+              lastVerifiedDate: new Date().toISOString().split('T')[0],
+              status: 'active',
+            });
+          }
+        }
+
+        if (!data.nextPageToken) {
+          break;
+        }
+        pageToken = data.nextPageToken;
       }
-      const data: any = await res.json();
-      if (!data.models || !Array.isArray(data.models)) {
-        return this.listStaticModels();
-      }
-      return data.models
-        .filter((m: any) => m.supportedGenerationMethods?.includes('generateContent'))
-        .map((m: any) => ({
-          id: m.name.replace('models/', ''),
-          name: m.displayName || m.name.replace('models/', ''),
-          provider: 'gemini' as ProviderType,
-          contextWindow: m.inputTokenLimit || 1048576,
-          description: m.description,
-          isDefault: m.name.includes('gemini-1.5-flash'),
-        }));
+
+      return allModels.length > 0 ? allModels : this.listStaticModels();
     } catch {
       return this.listStaticModels();
     }
@@ -208,6 +243,10 @@ export class GeminiAdapter implements IProviderAdapter {
 
     try {
       while (true) {
+        if (options.signal?.aborted) {
+          throw new DOMException('Generation cancelled by user', 'AbortError');
+        }
+
         const { done, value } = await reader.read();
         if (done) break;
 

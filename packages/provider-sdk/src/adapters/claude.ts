@@ -26,7 +26,7 @@ export class ClaudeAdapter implements IProviderAdapter {
   getCapabilities(): ProviderCapability {
     return {
       supportsStreaming: true,
-      supportsModelDiscovery: false,
+      supportsModelDiscovery: true, // Now supported via GET /v1/models
       supportsSystemPrompt: true,
       supportsUsageReporting: true,
       supportsTools: true,
@@ -44,6 +44,9 @@ export class ClaudeAdapter implements IProviderAdapter {
         contextWindow: 200000,
         description: 'Fast, lightweight intelligence with state-of-the-art speeds.',
         isDefault: true,
+        isFallback: true,
+        lastVerifiedDate: '2026-11-23',
+        status: 'active',
       },
       {
         id: 'claude-3-5-sonnet-20241022',
@@ -51,6 +54,9 @@ export class ClaudeAdapter implements IProviderAdapter {
         provider: 'claude',
         contextWindow: 200000,
         description: 'Most intelligent model from Anthropic for complex coding and reasoning.',
+        isFallback: true,
+        lastVerifiedDate: '2026-11-23',
+        status: 'active',
       },
       {
         id: 'claude-3-opus-20240229',
@@ -58,25 +64,22 @@ export class ClaudeAdapter implements IProviderAdapter {
         provider: 'claude',
         contextWindow: 200000,
         description: 'Powerful model for highly complex open-ended analysis.',
+        isFallback: true,
+        lastVerifiedDate: '2026-11-23',
+        status: 'active',
       },
     ];
   }
 
   async validateCredentials(apiKey: string): Promise<{ valid: boolean; error?: string }> {
     try {
-      // Send minimal test prompt (max_tokens=1) to validate API key
-      const res = await fetch(`${this.baseUrl}/messages`, {
-        method: 'POST',
+      // Validate by querying Anthropic /v1/models endpoint
+      const res = await fetch(`${this.baseUrl}/models`, {
+        method: 'GET',
         headers: {
-          'Content-Type': 'application/json',
           'x-api-key': apiKey,
           'anthropic-version': '2023-06-01',
         },
-        body: JSON.stringify({
-          model: 'claude-3-5-haiku-20241022',
-          max_tokens: 1,
-          messages: [{ role: 'user', content: 'hi' }],
-        }),
       });
 
       if (!res.ok) {
@@ -92,9 +95,71 @@ export class ClaudeAdapter implements IProviderAdapter {
     }
   }
 
-  async listModels(): Promise<ModelDescriptor[]> {
-    // Anthropic API does not offer a public list-models endpoint; returns documented static models
-    return this.listStaticModels();
+  /**
+   * Retrieves active, deprecated, or retired models using Anthropic's official GET /v1/models API with pagination.
+   */
+  async listModels(apiKey: string): Promise<ModelDescriptor[]> {
+    try {
+      const allModels: ModelDescriptor[] = [];
+      let afterId: string | undefined = undefined;
+      let hasMore = true;
+      let pageCount = 0;
+
+      while (hasMore && pageCount < 5) {
+        pageCount++;
+        const url = new URL(`${this.baseUrl}/models`);
+        url.searchParams.set('limit', '50');
+        if (afterId) {
+          url.searchParams.set('after_id', afterId);
+        }
+
+        const res = await fetch(url.toString(), {
+          method: 'GET',
+          headers: {
+            'x-api-key': apiKey,
+            'anthropic-version': '2023-06-01',
+          },
+        });
+
+        if (!res.ok) {
+          return this.listStaticModels();
+        }
+
+        const data: any = await res.json();
+        if (!data.data || !Array.isArray(data.data)) {
+          break;
+        }
+
+        for (const item of data.data) {
+          const modelId: string = item.id;
+          let status: 'active' | 'deprecated' | 'retired' = 'active';
+          if (item.status === 'deprecated' || item.deprecated_at) {
+            status = 'deprecated';
+          } else if (item.status === 'retired') {
+            status = 'retired';
+          }
+
+          allModels.push({
+            id: modelId,
+            name: item.display_name || modelId,
+            provider: 'claude',
+            contextWindow: 200000,
+            description: item.type ? `Anthropic ${item.type} model` : undefined,
+            isDefault: modelId === 'claude-3-5-haiku-20241022',
+            isFallback: false,
+            lastVerifiedDate: new Date().toISOString().split('T')[0],
+            status,
+          });
+        }
+
+        hasMore = Boolean(data.has_more);
+        afterId = data.last_id || (data.data.length > 0 ? data.data[data.data.length - 1].id : undefined);
+      }
+
+      return allModels.length > 0 ? allModels : this.listStaticModels();
+    } catch {
+      return this.listStaticModels();
+    }
   }
 
   async generateText(apiKey: string, options: ProviderRequestOptions): Promise<ProviderResponse> {

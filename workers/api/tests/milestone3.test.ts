@@ -18,58 +18,61 @@ class MockD1Database {
   prepare(query: string) {
     const trimmed = query.trim();
     return {
-      bind: (...args: any[]) => ({
-        first: async <T = any>(): Promise<T | null> => {
-          if (trimmed.includes('FROM sessions s') && trimmed.includes('JOIN users u')) {
-            const tokenHash = args[0];
-            const nowIso = args[1];
-            const session = this.tables.sessions.find(
-              (s) => s.token_hash === tokenHash && s.expires_at > nowIso
-            );
-            if (!session) return null;
-            const user = this.tables.users.find((u) => u.id === session.user_id);
-            if (!user) return null;
-            return {
-              session_id: session.id,
-              expires_at: session.expires_at,
-              user_id: user.id,
-              email: user.email,
-              name: user.name,
-            } as T;
-          }
-          if (trimmed.includes('FROM provider_credentials WHERE user_id = ? AND provider_type = ?')) {
-            const [userId, providerType] = args;
-            const cred = this.tables.provider_credentials.find(
-              (c) => c.user_id === userId && c.provider_type === providerType && c.is_active === 1
-            );
-            return (cred as T) || null;
-          }
-          if (trimmed.includes('FROM provider_credentials WHERE id = ? AND user_id = ?')) {
-            const [id, userId] = args;
-            const cred = this.tables.provider_credentials.find(
-              (c) => c.id === id && c.user_id === userId
-            );
-            return (cred as T) || null;
-          }
-          if (trimmed.includes('FROM conversations WHERE id = ? AND user_id = ?')) {
-            const [id, userId] = args;
-            const conv = this.tables.conversations.find((c) => c.id === id && c.user_id === userId);
-            return (conv as T) || null;
-          }
-          if (trimmed.includes('SELECT') && trimmed.includes('COUNT(*) as total_requests')) {
-            const userId = args[0];
-            const events = this.tables.usage_events.filter((e) => e.user_id === userId);
-            const totalTokens = events.reduce((sum, e) => sum + (e.total_tokens || 0), 0);
-            return {
-              total_requests: events.length,
-              total_prompt_tokens: 100,
-              total_completion_tokens: 50,
-              total_tokens: totalTokens,
-            } as T;
-          }
-          return null;
-        },
-        all: async <T = any>(): Promise<{ results: T[] }> => {
+      bind: (...args: any[]) => {
+        // Normalize whitespace in trimmed for matching
+        const normalized = trimmed.replace(/\s+/g, ' ');
+        return {
+          first: async <T = any>(): Promise<T | null> => {
+            if (normalized.includes('FROM sessions s') && normalized.includes('JOIN users u')) {
+              const tokenHash = args[0];
+              const nowIso = args[1];
+              const session = this.tables.sessions.find(
+                (s) => s.token_hash === tokenHash && s.expires_at > nowIso
+              );
+              if (!session) return null;
+              const user = this.tables.users.find((u) => u.id === session.user_id);
+              if (!user) return null;
+              return {
+                session_id: session.id,
+                expires_at: session.expires_at,
+                user_id: user.id,
+                email: user.email,
+                name: user.name,
+              } as T;
+            }
+            if (normalized.includes('FROM provider_credentials WHERE user_id = ? AND provider_type = ?')) {
+              const [userId, providerType] = args;
+              const cred = this.tables.provider_credentials.find(
+                (c) => c.user_id === userId && c.provider_type === providerType && c.is_active === 1
+              );
+              return (cred as T) || null;
+            }
+            if (normalized.includes('FROM provider_credentials WHERE id = ? AND user_id = ?')) {
+              const [id, userId] = args;
+              const cred = this.tables.provider_credentials.find(
+                (c) => c.id === id && c.user_id === userId
+              );
+              return (cred as T) || null;
+            }
+            if (normalized.includes('FROM conversations WHERE id = ? AND user_id = ?')) {
+              const [id, userId] = args;
+              const conv = this.tables.conversations.find((c) => c.id === id && c.user_id === userId);
+              return (conv as T) || null;
+            }
+            if (normalized.includes('SELECT') && normalized.includes('COUNT(*) as total_requests')) {
+              const userId = args[0];
+              const events = this.tables.usage_events.filter((e) => e.user_id === userId);
+              const totalTokens = events.reduce((sum, e) => sum + (e.total_tokens || 0), 0);
+              return {
+                total_requests: events.length,
+                total_prompt_tokens: 100,
+                total_completion_tokens: 50,
+                total_tokens: totalTokens,
+              } as T;
+            }
+            return null;
+          },
+          all: async <T = any>(): Promise<{ results: T[] }> => {
           if (trimmed.includes('FROM provider_credentials WHERE user_id = ?')) {
             const userId = args[0];
             return { results: this.tables.provider_credentials.filter((c) => c.user_id === userId) as T[] };
@@ -132,9 +135,10 @@ class MockD1Database {
           }
           return { meta: { changes: 1 } };
         },
-      }),
-    };
-  }
+      };
+    },
+  };
+}
 }
 
 const HEX_SECRET = '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef';
@@ -333,5 +337,82 @@ describe('Milestone 3 — End-to-End Chat, BYOK & Multi-Provider Integration Tes
     expect(json.success).toBe(true);
     expect(json.data.responseA.content).toBe('Gemini comparative response');
     expect(json.data.responseB.content).toBe('OpenAI comparative response');
+  });
+
+  it('smoke-test validates provider credentials through user-triggered test without charging production', async () => {
+    const credId = 'cred-smoke-test';
+    const enc = await encryptCredential('test-smoke-key', HEX_SECRET, { userId, credentialId: credId });
+    mockDb.tables.provider_credentials.push({
+      id: credId,
+      user_id: userId,
+      provider_type: 'gemini',
+      label: 'Gemini Smoke Test',
+      encrypted_key: enc.encryptedKey,
+      key_iv: enc.keyIv,
+      encryption_version: enc.encryptionVersion,
+      default_model: 'gemini-1.5-flash',
+      is_active: 1,
+    });
+
+    global.fetch = vi.fn().mockImplementation(async (url: string) => {
+      if (url.includes('streamGenerateContent')) {
+        const stream = new ReadableStream({
+          start(controller) {
+            const chunk = JSON.stringify({
+              candidates: [{ content: { parts: [{ text: 'Smoke test response' }] } }],
+              usageMetadata: { promptTokenCount: 5, candidatesTokenCount: 5 },
+            });
+            controller.enqueue(new TextEncoder().encode(`data: ${chunk}\n\n`));
+            controller.close();
+          },
+        });
+        return new Response(stream, {
+          status: 200,
+          headers: { 'Content-Type': 'text/event-stream' },
+        });
+      }
+      return new Response(
+        JSON.stringify({
+          candidates: [{ content: { parts: [{ text: 'Smoke test response' }] } }],
+          usageMetadata: { promptTokenCount: 5, candidatesTokenCount: 5 },
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } }
+      );
+    });
+
+    const req = new Request(`http://localhost/providers/credentials/${credId}/smoke-test`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${userToken}`,
+        'Origin': 'http://localhost:5173',
+      },
+    });
+
+    const res = await app.fetch(req, env);
+    const json: any = await res.json();
+    expect(res.status).toBe(200);
+    expect(json.success).toBe(true);
+    expect(json.data.provider).toBe('gemini');
+    expect(json.data.authStatus).toBe('passed');
+    expect(json.data.generationStatus).toBe('passed');
+    expect(json.data.streamingStatus).toBe('passed');
+  });
+
+  it('POST /chat/stop aborts active streams cleanly', async () => {
+    const req = new Request('http://localhost/chat/stop', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${userToken}`,
+        'Origin': 'http://localhost:5173',
+      },
+      body: JSON.stringify({ conversationId: 'conv-test-active-1' }),
+    });
+
+    const res = await app.fetch(req, env);
+    expect(res.status).toBe(200);
+    const json: any = await res.json();
+    expect(json.success).toBe(true);
+    expect(json.data.message).toBeDefined();
   });
 });

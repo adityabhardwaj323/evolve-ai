@@ -11,6 +11,12 @@ chatRouter.use('*', requireAuth);
 const registry = ProviderRegistry.getInstance();
 
 /**
+ * In-memory map of active abort controllers for stream cancellation
+ * Key format: `user_{userId}_conv_{conversationId}`
+ */
+const activeGenerations = new Map<string, AbortController>();
+
+/**
  * Helper to fetch and decrypt a user's active credential for a given providerType
  */
 async function getDecryptedCredential(
@@ -111,12 +117,10 @@ chatRouter.post('/generate', async (c) => {
         result.usage?.totalTokens || 0
       ).run();
 
-      // Update conversation timestamp
       await c.env.DB.prepare('UPDATE conversations SET updated_at = CURRENT_TIMESTAMP WHERE id = ? AND user_id = ?')
         .bind(conversationId, user.id).run();
     }
 
-    // Record usage event
     if (result.usage) {
       await c.env.DB.prepare(
         `INSERT INTO usage_events (id, user_id, conversation_id, provider_type, model, prompt_tokens, completion_tokens, total_tokens, success, created_at)
@@ -150,7 +154,7 @@ chatRouter.post('/generate', async (c) => {
 
 /**
  * POST /chat/stream
- * Server-Sent Events (SSE) streaming chat completion
+ * Server-Sent Events (SSE) streaming chat completion with real cancellation support
  */
 chatRouter.post('/stream', async (c) => {
   const user = c.get('user');
@@ -175,7 +179,17 @@ chatRouter.post('/stream', async (c) => {
 
   const adapter = registry.get(providerType);
 
-  // Set up SSE TransformStream
+  // Setup abort controller for upstream cancellation
+  const upstreamController = new AbortController();
+  const generationKey = `user_${user.id}_conv_${conversationId || 'standalone'}`;
+  activeGenerations.set(generationKey, upstreamController);
+
+  // If client disconnects, abort upstream request immediately
+  c.req.raw.signal.addEventListener('abort', () => {
+    upstreamController.abort();
+    activeGenerations.delete(generationKey);
+  });
+
   const { readable, writable } = new TransformStream();
   const writer = writable.getWriter();
   const encoder = new TextEncoder();
@@ -184,11 +198,10 @@ chatRouter.post('/stream', async (c) => {
     try {
       await writer.write(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
     } catch {
-      // client disconnected
+      upstreamController.abort();
     }
   };
 
-  // Run stream in background execution without blocking initial HTTP headers
   (async () => {
     let fullResponseText = '';
     let finalUsage: any = null;
@@ -202,6 +215,7 @@ chatRouter.post('/stream', async (c) => {
           systemPrompt,
           temperature,
           maxTokens,
+          signal: upstreamController.signal,
         },
         async (event) => {
           if (event.type === 'content_delta' && event.content) {
@@ -218,7 +232,6 @@ chatRouter.post('/stream', async (c) => {
       fullResponseText = response.content;
       finalUsage = response.usage || finalUsage;
 
-      // Persist to D1
       if (conversationId && fullResponseText) {
         const lastUserMsg = messages[messages.length - 1];
         if (lastUserMsg && lastUserMsg.role === 'user') {
@@ -261,8 +274,13 @@ chatRouter.post('/stream', async (c) => {
         ).run();
       }
     } catch (err: any) {
-      await sendEvent({ type: 'error', error: err.message || 'Stream processing failed' });
+      if (err.name === 'AbortError' || upstreamController.signal.aborted) {
+        await sendEvent({ type: 'content_delta', content: '\n\n[Generation stopped by user]' });
+      } else {
+        await sendEvent({ type: 'error', error: err.message || 'Stream processing failed' });
+      }
     } finally {
+      activeGenerations.delete(generationKey);
       await writer.write(encoder.encode('data: [DONE]\n\n'));
       await writer.close();
     }
@@ -279,8 +297,28 @@ chatRouter.post('/stream', async (c) => {
 });
 
 /**
+ * POST /chat/stop
+ * Explicit endpoint to cancel an active streaming generation
+ */
+chatRouter.post('/stop', async (c) => {
+  const user = c.get('user');
+  const body = await c.req.json().catch(() => ({}));
+  const conversationId = body.conversationId || 'standalone';
+  const generationKey = `user_${user.id}_conv_${conversationId}`;
+
+  const controller = activeGenerations.get(generationKey);
+  if (controller) {
+    controller.abort();
+    activeGenerations.delete(generationKey);
+    return c.json({ success: true, data: { message: 'Generation aborted successfully.' } });
+  }
+
+  return c.json({ success: true, data: { message: 'No active generation found to abort.' } });
+});
+
+/**
  * POST /chat/compare
- * Two-model simultaneous comparison
+ * Two-model simultaneous comparison with independent timeout & cancellation handling
  */
 chatRouter.post('/compare', async (c) => {
   const user = c.get('user');
@@ -295,9 +333,12 @@ chatRouter.post('/compare', async (c) => {
     return c.json({ success: false, error: { code: 'INVALID_INPUT', message: 'prompt, modelA, and modelB are required.' } }, 400);
   }
 
-  // Execute both models concurrently with Promise.allSettled
   const executeModel = async (config: { providerType: ProviderType; model: string; credentialId?: string }) => {
     const start = Date.now();
+    // 30s independent timeout controller for comparison requests
+    const timeoutController = new AbortController();
+    const timer = setTimeout(() => timeoutController.abort(), 30000);
+
     try {
       const cred = await getDecryptedCredential(c.env.DB, c.env.ENCRYPTION_SECRET, user.id, config.providerType, config.credentialId);
       const adapter = registry.get(config.providerType);
@@ -306,9 +347,11 @@ chatRouter.post('/compare', async (c) => {
         {
           model: config.model,
           messages: [{ role: 'user', content: prompt }],
+          signal: timeoutController.signal,
         },
         cred.customEndpoint
       );
+      clearTimeout(timer);
       return {
         providerType: config.providerType,
         model: config.model,
@@ -317,11 +360,12 @@ chatRouter.post('/compare', async (c) => {
         latencyMs: Date.now() - start,
       };
     } catch (err: any) {
+      clearTimeout(timer);
       return {
         providerType: config.providerType,
         model: config.model,
         content: '',
-        error: err.message || 'Model execution failed',
+        error: err.name === 'AbortError' ? 'Model request timed out after 30s' : (err.message || 'Model execution failed'),
         latencyMs: Date.now() - start,
       };
     }

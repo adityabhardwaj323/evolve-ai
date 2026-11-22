@@ -27,6 +27,9 @@ export interface ModelDescriptor {
   description?: string;
   isDefault?: boolean;
   capabilities?: ProviderCapability;
+  isFallback?: boolean;
+  lastVerifiedDate?: string;
+  status?: 'active' | 'deprecated' | 'retired' | 'unknown';
 }
 
 export interface ProviderMetadata {
