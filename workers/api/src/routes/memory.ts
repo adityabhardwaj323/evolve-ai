@@ -19,6 +19,32 @@ memoryRouter.use('*', requireAuth);
 
 const registry = ProviderRegistry.getInstance();
 
+const VALID_CATEGORIES = new Set<MemoryCategory>([
+  'personal_preference',
+  'interest',
+  'goal_ambition',
+  'skill_knowledge',
+  'project',
+  'decision',
+  'verified_fact',
+  'correction',
+  'working_preference',
+  'temporary_context',
+]);
+
+const VALID_VERIFICATION_STATUSES = new Set<VerificationStatus>([
+  'unverified',
+  'verified',
+]);
+
+/**
+ * Validates project ownership for authenticated user.
+ */
+async function validateProjectOwnership(db: D1Database, userId: string, projectId: string): Promise<boolean> {
+  const row = await db.prepare('SELECT id FROM projects WHERE id = ? AND user_id = ?').bind(projectId, userId).first();
+  return Boolean(row);
+}
+
 /**
  * Helper to map DB row to shared Memory interface
  */
@@ -57,6 +83,13 @@ memoryRouter.get('/', async (c) => {
   const search = c.req.query('search');
   const limit = Math.min(Number(c.req.query('limit')) || 50, 100);
   const offset = Number(c.req.query('offset')) || 0;
+
+  if (projectId && projectId !== 'null' && projectId !== '') {
+    const isOwner = await validateProjectOwnership(c.env.DB, user.id, projectId);
+    if (!isOwner) {
+      return c.json({ success: false, error: { code: 'FORBIDDEN', message: 'Project not found or unauthorized.' } }, 404);
+    }
+  }
 
   let query = 'SELECT * FROM memories WHERE user_id = ?';
   const params: any[] = [user.id];
@@ -144,7 +177,8 @@ memoryRouter.get('/stats', async (c) => {
 
 /**
  * POST /memory
- * Create a new personal memory explicitly
+ * Create a new personal memory candidate explicitly.
+ * Never trusts client-supplied status; always starts as 'candidate'.
  */
 memoryRouter.post('/', async (c) => {
   const user = c.get('user');
@@ -154,14 +188,50 @@ memoryRouter.post('/', async (c) => {
     return c.json({ success: false, error: { code: 'INVALID_INPUT', message: 'content and category are required.' } }, 400);
   }
 
-  if (containsSensitiveData(body.content)) {
+  const content = String(body.content).trim();
+  const category = String(body.category) as MemoryCategory;
+
+  if (content.length === 0 || content.length > 5000) {
+    return c.json({ success: false, error: { code: 'INVALID_INPUT', message: 'content must be between 1 and 5000 characters.' } }, 400);
+  }
+
+  if (!VALID_CATEGORIES.has(category)) {
+    return c.json({ success: false, error: { code: 'INVALID_CATEGORY', message: `Invalid category. Allowed: ${Array.from(VALID_CATEGORIES).join(', ')}` } }, 400);
+  }
+
+  if (containsSensitiveData(content)) {
     return c.json({
       success: false,
       error: { code: 'SENSITIVE_DATA_BLOCKED', message: 'Personal memory cannot store passwords, API keys, or financial secrets.' },
     }, 400);
   }
 
-  const { content, category, title, projectId, sourceType, sourceId, sourceMessageId, status, confidence, importance } = body;
+  const { title, projectId, sourceType, sourceId, sourceMessageId, confidence, importance } = body;
+
+  if (title && String(title).length > 200) {
+    return c.json({ success: false, error: { code: 'INVALID_INPUT', message: 'title cannot exceed 200 characters.' } }, 400);
+  }
+
+  const numConfidence = confidence !== undefined ? Number(confidence) : 0.8;
+  const numImportance = importance !== undefined ? Number(importance) : 0.5;
+
+  if (isNaN(numConfidence) || numConfidence < 0 || numConfidence > 1) {
+    return c.json({ success: false, error: { code: 'INVALID_INPUT', message: 'confidence must be a number between 0.0 and 1.0.' } }, 400);
+  }
+
+  if (isNaN(numImportance) || numImportance < 0 || numImportance > 1) {
+    return c.json({ success: false, error: { code: 'INVALID_INPUT', message: 'importance must be a number between 0.0 and 1.0.' } }, 400);
+  }
+
+  if (projectId) {
+    const isOwner = await validateProjectOwnership(c.env.DB, user.id, projectId);
+    if (!isOwner) {
+      return c.json({ success: false, error: { code: 'PROJECT_UNAUTHORIZED', message: 'Project not found or unauthorized.' } }, 404);
+    }
+  }
+
+  // Strictly enforce candidate status on creation. Client cannot bypass approval.
+  const enforcedStatus: MemoryStatus = 'candidate';
   const id = crypto.randomUUID();
 
   await c.env.DB.prepare(
@@ -175,19 +245,19 @@ memoryRouter.post('/', async (c) => {
     user.id,
     projectId || null,
     category,
-    title || content.slice(0, 40),
-    content.trim(),
-    confidence ?? 0.8,
-    importance ?? 0.5,
+    title ? String(title).trim() : content.slice(0, 40),
+    content,
+    numConfidence,
+    numImportance,
     sourceType || 'direct_entry',
     sourceId || null,
     sourceMessageId || null,
-    status || 'candidate'
+    enforcedStatus
   ).run();
 
   return c.json({
     success: true,
-    data: { id, content, category, status: status || 'candidate' },
+    data: { id, content, category, status: enforcedStatus },
   }, 201);
 });
 
@@ -201,8 +271,29 @@ memoryRouter.post('/extract', async (c) => {
   const body = await c.req.json().catch(() => ({}));
   const { messages, conversationId, providerType, credentialId } = body;
 
-  if (!messages || !Array.isArray(messages) || messages.length === 0) {
-    return c.json({ success: false, error: { code: 'INVALID_INPUT', message: 'messages array is required.' } }, 400);
+  let sourceMessages = messages;
+
+  // Validate conversation ownership if conversationId provided
+  if (conversationId) {
+    const conv = await c.env.DB.prepare(
+      'SELECT id FROM conversations WHERE id = ? AND user_id = ?'
+    ).bind(conversationId, user.id).first();
+    if (!conv) {
+      return c.json({ success: false, error: { code: 'CONVERSATION_UNAUTHORIZED', message: 'Conversation not found or unauthorized.' } }, 404);
+    }
+
+    // Prefer retrieving persisted conversation messages from D1
+    const persistedRows = await c.env.DB.prepare(
+      'SELECT role, content FROM messages WHERE conversation_id = ? AND user_id = ? ORDER BY created_at ASC LIMIT 50'
+    ).bind(conversationId, user.id).all();
+
+    if (persistedRows.results && persistedRows.results.length > 0) {
+      sourceMessages = persistedRows.results;
+    }
+  }
+
+  if (!sourceMessages || !Array.isArray(sourceMessages) || sourceMessages.length === 0) {
+    return c.json({ success: false, error: { code: 'INVALID_INPUT', message: 'Valid conversation messages are required.' } }, 400);
   }
 
   // Load existing user memories to avoid reintroducing duplicates
@@ -221,14 +312,19 @@ memoryRouter.post('/extract', async (c) => {
   }
 
   let candidates: any[] = [];
-  const latestUserText = messages.filter((m: any) => m.role === 'user').pop()?.content || '';
+  const latestUserText = sourceMessages.filter((m: any) => m.role === 'user').pop()?.content || '';
 
   // If user provided provider credentials, attempt structured extraction via provider
   if (providerType) {
     try {
-      const cred = await c.env.DB.prepare(
-        'SELECT id, encrypted_key, key_iv, encryption_version, custom_endpoint, default_model FROM provider_credentials WHERE user_id = ? AND provider_type = ? AND is_active = 1'
-      ).bind(user.id, providerType).first<any>();
+      let credQuery = 'SELECT id, encrypted_key, key_iv, encryption_version, custom_endpoint, default_model FROM provider_credentials WHERE user_id = ? AND provider_type = ? AND is_active = 1';
+      const credParams: any[] = [user.id, providerType];
+      if (credentialId) {
+        credQuery += ' AND id = ?';
+        credParams.push(credentialId);
+      }
+
+      const cred = await c.env.DB.prepare(credQuery).bind(...credParams).first<any>();
 
       if (cred) {
         const rawKey = await decryptCredential(
@@ -238,7 +334,7 @@ memoryRouter.post('/extract', async (c) => {
         );
 
         const adapter = registry.get(providerType);
-        const prompt = buildMemoryExtractionPrompt(messages, existingMemories);
+        const prompt = buildMemoryExtractionPrompt(sourceMessages, existingMemories);
         const res = await adapter.generateText(rawKey, {
           model: cred.default_model,
           messages: [{ role: 'user', content: prompt }],
@@ -247,6 +343,8 @@ memoryRouter.post('/extract', async (c) => {
         }, cred.custom_endpoint);
 
         candidates = parseExtractionResponse(res.content, latestUserText);
+      } else {
+        candidates = parseExtractionResponse('', latestUserText);
       }
     } catch {
       // Fallback to deterministic extraction on model failure
@@ -256,8 +354,11 @@ memoryRouter.post('/extract', async (c) => {
     candidates = parseExtractionResponse('', latestUserText);
   }
 
+  // Filter out any candidates containing sensitive data
+  const safeCandidates = candidates.filter((item) => !containsSensitiveData(item.content));
+
   // Deduplicate and detect conflicts
-  const evaluatedCandidates = deduplicateAndDetectConflicts(candidates, existingMemories);
+  const evaluatedCandidates = deduplicateAndDetectConflicts(safeCandidates, existingMemories);
 
   // If auto-save policy is enabled, persist non-duplicate candidates as approved
   const autoApprove = prefs?.auto_memory_approval === 1;
@@ -311,6 +412,13 @@ memoryRouter.post('/retrieve', async (c) => {
 
   const { query, projectId, limit, categories, includeCandidates } = body;
 
+  if (projectId) {
+    const isOwner = await validateProjectOwnership(c.env.DB, user.id, projectId);
+    if (!isOwner) {
+      return c.json({ success: false, error: { code: 'PROJECT_UNAUTHORIZED', message: 'Project not found or unauthorized.' } }, 404);
+    }
+  }
+
   const rows = await c.env.DB.prepare(
     'SELECT * FROM memories WHERE user_id = ? AND status != "deleted"'
   ).bind(user.id).all();
@@ -322,7 +430,7 @@ memoryRouter.post('/retrieve', async (c) => {
     query,
     limit: limit || 6,
     categories,
-    includeCandidates,
+    includeCandidates: Boolean(includeCandidates),
   });
 
   // Log retrieval in memory_access_logs
@@ -466,11 +574,43 @@ memoryRouter.patch('/:id', async (c) => {
 
   const { title, content, category, importance, verificationStatus, projectId } = body;
 
-  if (content && containsSensitiveData(content)) {
-    return c.json({
-      success: false,
-      error: { code: 'SENSITIVE_DATA_BLOCKED', message: 'Cannot save sensitive secrets or passwords in memory.' },
-    }, 400);
+  if (category && !VALID_CATEGORIES.has(category)) {
+    return c.json({ success: false, error: { code: 'INVALID_CATEGORY', message: `Invalid category. Allowed: ${Array.from(VALID_CATEGORIES).join(', ')}` } }, 400);
+  }
+
+  if (verificationStatus && !VALID_VERIFICATION_STATUSES.has(verificationStatus)) {
+    return c.json({ success: false, error: { code: 'INVALID_VERIFICATION_STATUS', message: `Invalid verificationStatus. Allowed: ${Array.from(VALID_VERIFICATION_STATUSES).join(', ')}` } }, 400);
+  }
+
+  if (content !== undefined) {
+    const trimmedContent = String(content).trim();
+    if (trimmedContent.length === 0 || trimmedContent.length > 5000) {
+      return c.json({ success: false, error: { code: 'INVALID_INPUT', message: 'content must be between 1 and 5000 characters.' } }, 400);
+    }
+    if (containsSensitiveData(trimmedContent)) {
+      return c.json({
+        success: false,
+        error: { code: 'SENSITIVE_DATA_BLOCKED', message: 'Cannot save sensitive secrets or passwords in memory.' },
+      }, 400);
+    }
+  }
+
+  if (title !== undefined && String(title).length > 200) {
+    return c.json({ success: false, error: { code: 'INVALID_INPUT', message: 'title cannot exceed 200 characters.' } }, 400);
+  }
+
+  if (importance !== undefined) {
+    const numImportance = Number(importance);
+    if (isNaN(numImportance) || numImportance < 0 || numImportance > 1) {
+      return c.json({ success: false, error: { code: 'INVALID_INPUT', message: 'importance must be between 0.0 and 1.0.' } }, 400);
+    }
+  }
+
+  if (projectId) {
+    const isOwner = await validateProjectOwnership(c.env.DB, user.id, projectId);
+    if (!isOwner) {
+      return c.json({ success: false, error: { code: 'PROJECT_UNAUTHORIZED', message: 'Project not found or unauthorized.' } }, 404);
+    }
   }
 
   const res = await c.env.DB.prepare(
@@ -484,10 +624,10 @@ memoryRouter.patch('/:id', async (c) => {
          updated_at = CURRENT_TIMESTAMP
      WHERE id = ? AND user_id = ?`
   ).bind(
-    title || null,
-    content || null,
+    title ? String(title).trim() : null,
+    content ? String(content).trim() : null,
     category || null,
-    importance ?? null,
+    importance !== undefined ? Number(importance) : null,
     verificationStatus || null,
     projectId !== undefined ? (projectId || null) : null,
     id,
@@ -503,7 +643,7 @@ memoryRouter.patch('/:id', async (c) => {
 
 /**
  * GET /memory/export
- * Export user's complete memory history as JSON
+ * Export user's complete memory history as JSON including related graph and access logs
  */
 memoryRouter.get('/export', async (c) => {
   const user = c.get('user');
@@ -514,43 +654,105 @@ memoryRouter.get('/export', async (c) => {
 
   const memories = (rows.results || []).map(mapMemoryRow);
 
+  const logs = await c.env.DB.prepare(
+    'SELECT id, memory_id, retrieval_query, created_at FROM memory_access_logs WHERE user_id = ? ORDER BY created_at DESC'
+  ).bind(user.id).all();
+
+  const entities = await c.env.DB.prepare(
+    'SELECT id, project_id, name, entity_type, description, created_at FROM knowledge_entities WHERE user_id = ? AND entity_type = "memory"'
+  ).bind(user.id).all();
+
   return c.json({
     success: true,
     data: {
       exportedAt: new Date().toISOString(),
       user: { id: user.id, email: user.email },
       memories,
+      memoryAccessLogs: logs.results || [],
+      memoryGraphEntities: entities.results || [],
+      metadata: {
+        totalMemories: memories.length,
+        totalLogs: (logs.results || []).length,
+        dataScope: 'All active, candidate, and archived user memories, access audit logs, and linked knowledge graph memory entities.',
+      },
     },
   });
 });
 
 /**
  * DELETE /memory/all
- * Complete deletion of all user memories (Privacy / Right to be Forgotten)
+ * Complete deletion of all user memories, access logs, related graph nodes and edges (Privacy / GDPR)
  */
 memoryRouter.delete('/all', async (c) => {
   const user = c.get('user');
 
-  const res = await c.env.DB.prepare(
-    'DELETE FROM memories WHERE user_id = ?'
-  ).bind(user.id).run();
-
+  // 1. Delete memory access logs
   await c.env.DB.prepare(
     'DELETE FROM memory_access_logs WHERE user_id = ?'
   ).bind(user.id).run();
 
+  // 2. Identify and delete memory-type knowledge graph entities and their relations
+  const memoryEntities = await c.env.DB.prepare(
+    'SELECT id FROM knowledge_entities WHERE user_id = ? AND entity_type = "memory"'
+  ).bind(user.id).all();
+
+  for (const ent of (memoryEntities.results || [])) {
+    await c.env.DB.prepare(
+      'DELETE FROM knowledge_relations WHERE user_id = ? AND (source_entity_id = ? OR target_entity_id = ?)'
+    ).bind(user.id, ent.id, ent.id).run();
+  }
+
+  await c.env.DB.prepare(
+    'DELETE FROM knowledge_entities WHERE user_id = ? AND entity_type = "memory"'
+  ).bind(user.id).run();
+
+  // 3. Nullify memory references in feedback records
+  await c.env.DB.prepare(
+    'UPDATE feedback SET memory_ids_json = NULL WHERE user_id = ?'
+  ).bind(user.id).run();
+
+  // 4. Delete all memories
+  const res = await c.env.DB.prepare(
+    'DELETE FROM memories WHERE user_id = ?'
+  ).bind(user.id).run();
+
   return c.json({
     success: true,
-    data: { deletedCount: res.meta.changes ?? 0, message: 'All personal memories deleted successfully.' },
+    data: {
+      deletedCount: res.meta.changes ?? 0,
+      cleanedGraphEntities: (memoryEntities.results || []).length,
+      message: 'All personal memories, access logs, and related graph nodes deleted successfully.',
+    },
   });
 });
 
 /**
  * DELETE /memory/:id
+ * Delete specific memory and cleanup linked graph entity/relations
  */
 memoryRouter.delete('/:id', async (c) => {
   const user = c.get('user');
   const memId = c.req.param('id');
+
+  // Clean up any memory access logs for this memory
+  await c.env.DB.prepare(
+    'DELETE FROM memory_access_logs WHERE memory_id = ? AND user_id = ?'
+  ).bind(memId, user.id).run();
+
+  // Clean up any graph entity representing this memory (e.g. name matching memId)
+  const graphEntity = await c.env.DB.prepare(
+    'SELECT id FROM knowledge_entities WHERE user_id = ? AND entity_type = "memory" AND (name = ? OR description LIKE ?)'
+  ).bind(user.id, memId, `%${memId}%`).first<any>();
+
+  if (graphEntity) {
+    await c.env.DB.prepare(
+      'DELETE FROM knowledge_relations WHERE user_id = ? AND (source_entity_id = ? OR target_entity_id = ?)'
+    ).bind(user.id, graphEntity.id, graphEntity.id).run();
+
+    await c.env.DB.prepare(
+      'DELETE FROM knowledge_entities WHERE id = ? AND user_id = ?'
+    ).bind(graphEntity.id, user.id).run();
+  }
 
   const res = await c.env.DB
     .prepare('DELETE FROM memories WHERE id = ? AND user_id = ?')

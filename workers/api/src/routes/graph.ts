@@ -6,6 +6,26 @@ import { KnowledgeEntity, KnowledgeRelation } from '@evolve-ai/shared-types';
 export const graphRouter = new Hono<{ Bindings: Env; Variables: AuthContext }>();
 graphRouter.use('*', requireAuth);
 
+const ALLOWED_ENTITY_TYPES = new Set(['user', 'project', 'technology', 'skill', 'goal', 'decision', 'memory', 'concept']);
+const ALLOWED_RELATION_TYPES = new Set([
+  'USER_WORKS_ON_PROJECT',
+  'PROJECT_USES_TECHNOLOGY',
+  'USER_HAS_SKILL',
+  'USER_HAS_GOAL',
+  'MEMORY_BELONGS_TO_PROJECT',
+  'MEMORY_RELATES_TO_MEMORY',
+  'DECISION_AFFECTS_PROJECT',
+  'RELATESTO',
+]);
+
+/**
+ * Validates that a project exists and is owned by the user.
+ */
+async function validateProjectOwnership(db: D1Database, userId: string, projectId: string): Promise<boolean> {
+  const row = await db.prepare('SELECT id FROM projects WHERE id = ? AND user_id = ?').bind(projectId, userId).first();
+  return Boolean(row);
+}
+
 /**
  * GET /knowledge-graph
  * Retrieve full or project-filtered graph nodes (entities) and edges (relations)
@@ -13,6 +33,13 @@ graphRouter.use('*', requireAuth);
 graphRouter.get('/', async (c) => {
   const user = c.get('user');
   const projectId = c.req.query('projectId');
+
+  if (projectId) {
+    const isOwner = await validateProjectOwnership(c.env.DB, user.id, projectId);
+    if (!isOwner) {
+      return c.json({ success: false, error: { code: 'FORBIDDEN', message: 'Project not found or unauthorized.' } }, 404);
+    }
+  }
 
   let entityQuery = 'SELECT * FROM knowledge_entities WHERE user_id = ?';
   const entityParams: any[] = [user.id];
@@ -23,7 +50,6 @@ graphRouter.get('/', async (c) => {
   }
 
   const entities = await c.env.DB.prepare(entityQuery).bind(...entityParams).all();
-
   const entityIds = new Set((entities.results || []).map((e: any) => e.id));
 
   // Fetch relations owned by user where both source and target exist
@@ -61,7 +87,7 @@ graphRouter.get('/', async (c) => {
 
 /**
  * POST /knowledge-graph/entities
- * Create entity
+ * Create entity with strict type and ownership validation
  */
 graphRouter.post('/entities', async (c) => {
   const user = c.get('user');
@@ -69,6 +95,29 @@ graphRouter.post('/entities', async (c) => {
 
   if (!body || !body.name || !body.entityType) {
     return c.json({ success: false, error: { code: 'INVALID_INPUT', message: 'name and entityType are required.' } }, 400);
+  }
+
+  const name = String(body.name).trim();
+  const entityType = String(body.entityType).toLowerCase().trim();
+  const description = body.description ? String(body.description).trim() : null;
+
+  if (name.length === 0 || name.length > 100) {
+    return c.json({ success: false, error: { code: 'INVALID_INPUT', message: 'Entity name must be between 1 and 100 characters.' } }, 400);
+  }
+
+  if (description && description.length > 500) {
+    return c.json({ success: false, error: { code: 'INVALID_INPUT', message: 'Description cannot exceed 500 characters.' } }, 400);
+  }
+
+  if (!ALLOWED_ENTITY_TYPES.has(entityType)) {
+    return c.json({ success: false, error: { code: 'INVALID_TYPE', message: `Invalid entityType. Allowed: ${Array.from(ALLOWED_ENTITY_TYPES).join(', ')}` } }, 400);
+  }
+
+  if (body.projectId) {
+    const isOwner = await validateProjectOwnership(c.env.DB, user.id, body.projectId);
+    if (!isOwner) {
+      return c.json({ success: false, error: { code: 'PROJECT_UNAUTHORIZED', message: 'Project not found or not owned by user.' } }, 404);
+    }
   }
 
   const id = crypto.randomUUID();
@@ -79,14 +128,14 @@ graphRouter.post('/entities', async (c) => {
     id,
     user.id,
     body.projectId || null,
-    body.name.trim(),
-    body.entityType,
-    body.description || null
+    name,
+    entityType,
+    description
   ).run();
 
   return c.json({
     success: true,
-    data: { id, name: body.name, entityType: body.entityType },
+    data: { id, name, entityType, projectId: body.projectId || null },
   }, 201);
 });
 
@@ -102,6 +151,11 @@ graphRouter.post('/relations', async (c) => {
     return c.json({ success: false, error: { code: 'INVALID_INPUT', message: 'sourceEntityId, targetEntityId, and relationType are required.' } }, 400);
   }
 
+  const relationType = String(body.relationType).toUpperCase().trim();
+  if (!ALLOWED_RELATION_TYPES.has(relationType)) {
+    return c.json({ success: false, error: { code: 'INVALID_RELATION_TYPE', message: `Invalid relationType. Allowed: ${Array.from(ALLOWED_RELATION_TYPES).join(', ')}` } }, 400);
+  }
+
   // Verify both entities belong to user
   const source = await c.env.DB.prepare('SELECT id FROM knowledge_entities WHERE id = ? AND user_id = ?').bind(body.sourceEntityId, user.id).first();
   const target = await c.env.DB.prepare('SELECT id FROM knowledge_entities WHERE id = ? AND user_id = ?').bind(body.targetEntityId, user.id).first();
@@ -114,11 +168,11 @@ graphRouter.post('/relations', async (c) => {
   await c.env.DB.prepare(
     `INSERT INTO knowledge_relations (id, user_id, source_entity_id, target_entity_id, relation_type, created_at)
      VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`
-  ).bind(id, user.id, body.sourceEntityId, body.targetEntityId, body.relationType).run();
+  ).bind(id, user.id, body.sourceEntityId, body.targetEntityId, relationType).run();
 
   return c.json({
     success: true,
-    data: { id, sourceEntityId: body.sourceEntityId, targetEntityId: body.targetEntityId, relationType: body.relationType },
+    data: { id, sourceEntityId: body.sourceEntityId, targetEntityId: body.targetEntityId, relationType },
   }, 201);
 });
 
@@ -128,6 +182,11 @@ graphRouter.post('/relations', async (c) => {
 graphRouter.delete('/entities/:id', async (c) => {
   const user = c.get('user');
   const id = c.req.param('id');
+
+  // Also clean up relations referencing this entity
+  await c.env.DB.prepare(
+    'DELETE FROM knowledge_relations WHERE user_id = ? AND (source_entity_id = ? OR target_entity_id = ?)'
+  ).bind(user.id, id, id).run();
 
   const res = await c.env.DB.prepare('DELETE FROM knowledge_entities WHERE id = ? AND user_id = ?').bind(id, user.id).run();
   if ((res.meta.changes ?? 0) === 0) {

@@ -2,9 +2,21 @@ import { Hono } from 'hono';
 import { Env } from '../index.js';
 import { requireAuth, AuthContext } from '../middleware/auth.js';
 import { FeedbackRecord, FeedbackType } from '@evolve-ai/shared-types';
+import { containsSensitiveData } from '@evolve-ai/memory-engine';
 
 export const feedbackRouter = new Hono<{ Bindings: Env; Variables: AuthContext }>();
 feedbackRouter.use('*', requireAuth);
+
+const ALLOWED_FEEDBACK_TYPES = new Set([
+  'useful',
+  'irrelevant',
+  'incorrect',
+  'incomplete',
+  'outdated',
+  'wrong_memory',
+  'missed_context',
+  'custom_correction',
+]);
 
 /**
  * GET /feedback
@@ -51,6 +63,59 @@ feedbackRouter.post('/', async (c) => {
   }
 
   const { messageId, conversationId, providerType, model, rating, feedbackType, correctionText, memoryIds } = body;
+
+  if (typeof rating !== 'number' || rating < 1 || rating > 5) {
+    return c.json({ success: false, error: { code: 'INVALID_RATING', message: 'Rating must be an integer between 1 and 5.' } }, 400);
+  }
+
+  if (!ALLOWED_FEEDBACK_TYPES.has(feedbackType)) {
+    return c.json({ success: false, error: { code: 'INVALID_FEEDBACK_TYPE', message: `Invalid feedbackType. Allowed: ${Array.from(ALLOWED_FEEDBACK_TYPES).join(', ')}` } }, 400);
+  }
+
+  // Verify conversation ownership if conversationId is provided
+  if (conversationId) {
+    const conv = await c.env.DB.prepare(
+      'SELECT id FROM conversations WHERE id = ? AND user_id = ?'
+    ).bind(conversationId, user.id).first();
+    if (!conv) {
+      return c.json({ success: false, error: { code: 'CONVERSATION_UNAUTHORIZED', message: 'Conversation not found or unauthorized.' } }, 404);
+    }
+  }
+
+  // Verify message ownership if messageId is provided
+  const msg = await c.env.DB.prepare(
+    'SELECT id, conversation_id FROM messages WHERE id = ? AND user_id = ?'
+  ).bind(messageId, user.id).first<any>();
+  if (!msg) {
+    return c.json({ success: false, error: { code: 'MESSAGE_UNAUTHORIZED', message: 'Message not found or unauthorized.' } }, 404);
+  }
+
+  // Verify referenced memory IDs belong to authenticated user
+  if (Array.isArray(memoryIds) && memoryIds.length > 0) {
+    for (const memId of memoryIds) {
+      const owned = await c.env.DB.prepare(
+        'SELECT id FROM memories WHERE id = ? AND user_id = ?'
+      ).bind(memId, user.id).first();
+      if (!owned) {
+        return c.json({ success: false, error: { code: 'MEMORY_UNAUTHORIZED', message: `Referenced memory ${memId} not found or unauthorized.` } }, 404);
+      }
+    }
+  }
+
+  // Validate correctionText if present
+  if (correctionText !== undefined && correctionText !== null) {
+    if (typeof correctionText !== 'string' || correctionText.length > 2000) {
+      return c.json({ success: false, error: { code: 'INVALID_CORRECTION', message: 'Correction text must be a string under 2000 characters.' } }, 400);
+    }
+
+    if (containsSensitiveData(correctionText)) {
+      return c.json({
+        success: false,
+        error: { code: 'SENSITIVE_DATA_BLOCKED', message: 'Feedback correction cannot contain API keys, passwords, or secrets.' },
+      }, 400);
+    }
+  }
+
   const id = crypto.randomUUID();
 
   await c.env.DB.prepare(
@@ -62,18 +127,18 @@ feedbackRouter.post('/', async (c) => {
     id,
     user.id,
     messageId,
-    conversationId || null,
+    conversationId || msg.conversation_id || null,
     providerType || null,
     model || null,
     rating,
     feedbackType,
-    correctionText || null,
+    correctionText ? correctionText.trim() : null,
     memoryIds ? JSON.stringify(memoryIds) : null
   ).run();
 
   let generatedCandidateId: string | null = null;
 
-  // If correction is provided, create a pending candidate memory in category 'correction'
+  // If correction is provided, create a pending candidate memory in category 'correction' (strictly candidate status)
   if (correctionText && correctionText.trim()) {
     generatedCandidateId = crypto.randomUUID();
     await c.env.DB.prepare(
@@ -86,7 +151,7 @@ feedbackRouter.post('/', async (c) => {
       user.id,
       `Correction: ${correctionText.slice(0, 35)}`,
       correctionText.trim(),
-      conversationId || null,
+      conversationId || msg.conversation_id || null,
       messageId
     ).run();
 

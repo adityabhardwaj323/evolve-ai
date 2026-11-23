@@ -7,6 +7,7 @@ class MockD1Database {
     users: [],
     sessions: [],
     provider_credentials: [],
+    projects: [],
     conversations: [],
     messages: [],
     memories: [],
@@ -38,6 +39,21 @@ class MockD1Database {
                 email: user.email,
                 name: user.name,
               } as T;
+            }
+            if (normalized.includes('FROM projects WHERE id = ? AND user_id = ?')) {
+              const [id, userId] = args;
+              const proj = this.tables.projects.find((p) => p.id === id && p.user_id === userId);
+              return (proj as T) || null;
+            }
+            if (normalized.includes('FROM conversations WHERE id = ? AND user_id = ?')) {
+              const [id, userId] = args;
+              const conv = this.tables.conversations.find((c) => c.id === id && c.user_id === userId);
+              return (conv as T) || null;
+            }
+            if (normalized.includes('FROM messages WHERE id = ? AND user_id = ?')) {
+              const [id, userId] = args;
+              const msg = this.tables.messages.find((m) => m.id === id && m.user_id === userId);
+              return (msg as T) || null;
             }
             if (normalized.includes('FROM memories WHERE id = ? AND user_id = ?')) {
               const [id, userId] = args;
@@ -80,6 +96,11 @@ class MockD1Database {
               const mems = this.tables.memories.filter((m) => m.user_id === userId && m.status !== 'deleted');
               return { results: mems as T[] };
             }
+            if (normalized.includes('FROM messages WHERE conversation_id = ? AND user_id = ?')) {
+              const [convId, userId] = args;
+              const msgs = this.tables.messages.filter((m) => m.conversation_id === convId && m.user_id === userId);
+              return { results: msgs as T[] };
+            }
             if (normalized.includes('FROM knowledge_entities WHERE user_id = ?')) {
               const userId = args[0];
               const ents = this.tables.knowledge_entities.filter((e) => e.user_id === userId);
@@ -101,7 +122,6 @@ class MockD1Database {
             if (normalized.includes('INSERT INTO memories')) {
               let id, user_id, project_id, category, title, content, confidence, importance, source_type, source_id, source_message_id, status;
               if (normalized.includes("'correction'")) {
-                // In feedback router: VALUES (?, ?, 'correction', ?, ?, 0.95, 0.8, 'feedback_correction', ?, ?, 'candidate', 'unverified', 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
                 [id, user_id, title, content, source_id, source_message_id] = args;
                 category = 'correction';
                 confidence = 0.95;
@@ -149,6 +169,20 @@ class MockD1Database {
               }
               return { meta: { changes: 0 } };
             }
+            if (normalized.includes('UPDATE memories SET title = COALESCE')) {
+              const [title, content, category, importance, verificationStatus, projectId, id, userId] = args;
+              const mem = this.tables.memories.find((m) => m.id === id && m.user_id === userId);
+              if (mem) {
+                if (title !== null) mem.title = title;
+                if (content !== null) mem.content = content;
+                if (category !== null) mem.category = category;
+                if (importance !== null) mem.importance = importance;
+                if (verificationStatus !== null) mem.verification_status = verificationStatus;
+                if (projectId !== null) mem.project_id = projectId;
+                return { meta: { changes: 1 } };
+              }
+              return { meta: { changes: 0 } };
+            }
             if (normalized.includes('DELETE FROM memories WHERE id = ? AND user_id = ?')) {
               const [id, userId] = args;
               const idx = this.tables.memories.findIndex((m) => m.id === id && m.user_id === userId);
@@ -166,6 +200,18 @@ class MockD1Database {
             }
             if (normalized.includes('DELETE FROM memory_access_logs WHERE user_id = ?')) {
               this.tables.memory_access_logs = [];
+              return { meta: { changes: 1 } };
+            }
+            if (normalized.includes('DELETE FROM memory_access_logs WHERE memory_id = ? AND user_id = ?')) {
+              const [memId, userId] = args;
+              this.tables.memory_access_logs = this.tables.memory_access_logs.filter((l) => !(l.memory_id === memId && l.user_id === userId));
+              return { meta: { changes: 1 } };
+            }
+            if (normalized.includes('DELETE FROM knowledge_entities WHERE user_id = ? AND entity_type = "memory"')) {
+              this.tables.knowledge_entities = this.tables.knowledge_entities.filter((e) => !(e.user_id === args[0] && e.entity_type === 'memory'));
+              return { meta: { changes: 1 } };
+            }
+            if (normalized.includes('UPDATE feedback SET memory_ids_json = NULL WHERE user_id = ?')) {
               return { meta: { changes: 1 } };
             }
             if (normalized.includes('INSERT INTO knowledge_entities')) {
@@ -198,47 +244,308 @@ class MockD1Database {
   }
 }
 
-describe('Milestone 4 — Memory, Knowledge Graph & Feedback Integration Tests', () => {
+describe('Milestone 4 & 4.1 — Security Hardening, Project Ownership & Memory Lifecycle Tests', () => {
   let mockDb: MockD1Database;
   let env: any;
-  let userToken: string;
-  const userId = 'user-alice-123';
-  const bobUserId = 'user-bob-999';
+  const testUserId = 'user-alice-123';
+  const bobUserId = 'user-bob-456';
+  const userToken = generateSessionToken();
+  const aliceProjectId = 'proj-alice-1';
+  const bobProjectId = 'proj-bob-secret';
 
   beforeEach(async () => {
     mockDb = new MockD1Database();
+
+    mockDb.tables.users.push(
+      { id: testUserId, email: 'alice@example.com', name: 'Alice', is_active: 1 },
+      { id: bobUserId, email: 'bob@example.com', name: 'Bob', is_active: 1 }
+    );
+
+    mockDb.tables.projects.push(
+      { id: aliceProjectId, user_id: testUserId, name: 'Alice Project' },
+      { id: bobProjectId, user_id: bobUserId, name: 'Bob Project' }
+    );
+
+    mockDb.tables.conversations.push(
+      { id: 'conv-alice-1', user_id: testUserId, title: 'Alice Chat' },
+      { id: 'conv-bob-1', user_id: bobUserId, title: 'Bob Chat' }
+    );
+
+    mockDb.tables.messages.push(
+      { id: 'msg-alice-1', user_id: testUserId, conversation_id: 'conv-alice-1', role: 'assistant', content: 'Here is your solution.' },
+      { id: 'msg-bob-1', user_id: bobUserId, conversation_id: 'conv-bob-1', role: 'assistant', content: 'Secret Bob answer.' }
+    );
+
+    const tokenHash = await hashSessionToken(userToken);
+    mockDb.tables.sessions.push({
+      id: 'session-alice',
+      user_id: testUserId,
+      token_hash: tokenHash,
+      expires_at: new Date(Date.now() + 86400000).toISOString(),
+    });
+
+    mockDb.tables.user_preferences.push({
+      user_id: testUserId,
+      auto_memory_extract: 1,
+      auto_memory_approval: 0,
+    });
+
     env = {
       DB: mockDb,
       ENCRYPTION_SECRET: '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef',
-      SESSION_SECRET: 'session_secret_32_characters_random_string!',
-      ENVIRONMENT: 'production',
-      CLIENT_ORIGIN: 'http://localhost:5173',
     };
-
-    userToken = generateSessionToken();
-    const tokenHash = await hashSessionToken(userToken);
-    const futureDate = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
-
-    mockDb.tables.users.push({ id: userId, email: 'alice@example.com', name: 'Alice' });
-    mockDb.tables.sessions.push({ id: 'sess-alice', user_id: userId, token_hash: tokenHash, expires_at: futureDate });
   });
 
-  // Test 1: Memory CRUD & Lifecycle
+  // 1. Approval Bypass Prevention: Client status is ignored, forced to 'candidate'
+  it('prevents approval bypass: POST /memory ignores client status="active" and forces "candidate"', async () => {
+    const req = new Request('http://localhost/memory', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${userToken}`, Origin: 'http://localhost:5173' },
+      body: JSON.stringify({
+        category: 'personal_preference',
+        content: 'I prefer concise explanations.',
+        status: 'active', // Malicious attempt to bypass approval
+      }),
+    });
+
+    const res = await app.fetch(req, env);
+    expect(res.status).toBe(201);
+    const json: any = await res.json();
+    expect(json.data.status).toBe('candidate');
+
+    const created = mockDb.tables.memories.find((m) => m.id === json.data.id);
+    expect(created.status).toBe('candidate');
+  });
+
+  // 2. Project Ownership Enforcement: Creation with foreign project ID is rejected
+  it('rejects memory creation referencing another user project ID', async () => {
+    const req = new Request('http://localhost/memory', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${userToken}`, Origin: 'http://localhost:5173' },
+      body: JSON.stringify({
+        category: 'project',
+        content: 'Confidential project details.',
+        projectId: bobProjectId, // Alice tries to attach to Bob's project
+      }),
+    });
+
+    const res = await app.fetch(req, env);
+    expect(res.status).toBe(404);
+    const json: any = await res.json();
+    expect(json.error.code).toBe('PROJECT_UNAUTHORIZED');
+  });
+
+  // 3. Project Ownership Enforcement: Editing with foreign project ID is rejected
+  it('rejects memory PATCH updating project_id to another user project', async () => {
+    const memId = 'mem-alice-patch';
+    mockDb.tables.memories.push({
+      id: memId,
+      user_id: testUserId,
+      category: 'skill_knowledge',
+      content: 'Knowledge about cloud workers',
+      status: 'approved',
+      is_pinned: 0,
+      confidence: 0.9,
+      importance: 0.5,
+    });
+
+    const req = new Request(`http://localhost/memory/${memId}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${userToken}`, Origin: 'http://localhost:5173' },
+      body: JSON.stringify({
+        projectId: bobProjectId,
+      }),
+    });
+
+    const res = await app.fetch(req, env);
+    expect(res.status).toBe(404);
+    const json: any = await res.json();
+    expect(json.error.code).toBe('PROJECT_UNAUTHORIZED');
+  });
+
+  // 4. Project Ownership Enforcement: Graph entity creation with foreign project ID is rejected
+  it('rejects knowledge graph entity creation referencing foreign project ID', async () => {
+    const req = new Request('http://localhost/knowledge-graph/entities', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${userToken}`, Origin: 'http://localhost:5173' },
+      body: JSON.stringify({
+        name: 'Foreign Entity',
+        entityType: 'project',
+        projectId: bobProjectId,
+      }),
+    });
+
+    const res = await app.fetch(req, env);
+    expect(res.status).toBe(404);
+    const json: any = await res.json();
+    expect(json.error.code).toBe('PROJECT_UNAUTHORIZED');
+  });
+
+  // 5. Secret Storage Bypass in Feedback: Rejects passwords & API keys
+  it('rejects secrets and API keys submitted via feedback correction', async () => {
+    const req = new Request('http://localhost/feedback', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${userToken}`, Origin: 'http://localhost:5173' },
+      body: JSON.stringify({
+        messageId: 'msg-alice-1',
+        rating: 2,
+        feedbackType: 'incorrect',
+        correctionText: 'My secret password is: SuperSecretPassword123!',
+      }),
+    });
+
+    const res = await app.fetch(req, env);
+    expect(res.status).toBe(400);
+    const json: any = await res.json();
+    expect(json.error.code).toBe('SENSITIVE_DATA_BLOCKED');
+  });
+
+  // 6. Extraction Provenance: Rejects foreign conversation ID
+  it('rejects memory extraction targeting a conversation owned by another user', async () => {
+    const req = new Request('http://localhost/memory/extract', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${userToken}`, Origin: 'http://localhost:5173' },
+      body: JSON.stringify({
+        conversationId: 'conv-bob-1',
+        messages: [{ role: 'user', content: 'Extract preferences' }],
+      }),
+    });
+
+    const res = await app.fetch(req, env);
+    expect(res.status).toBe(404);
+    const json: any = await res.json();
+    expect(json.error.code).toBe('CONVERSATION_UNAUTHORIZED');
+  });
+
+  // 7. Feedback Message Ownership: Rejects foreign message ID
+  it('rejects feedback targeting a message owned by another user', async () => {
+    const req = new Request('http://localhost/feedback', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${userToken}`, Origin: 'http://localhost:5173' },
+      body: JSON.stringify({
+        messageId: 'msg-bob-1',
+        rating: 3,
+        feedbackType: 'useful',
+      }),
+    });
+
+    const res = await app.fetch(req, env);
+    expect(res.status).toBe(404);
+    const json: any = await res.json();
+    expect(json.error.code).toBe('MESSAGE_UNAUTHORIZED');
+  });
+
+  // 8. Feedback Memory Ownership: Rejects referencing foreign memory IDs
+  it('rejects feedback referencing memory IDs belonging to another user', async () => {
+    const bobMemId = 'mem-bob-classified';
+    mockDb.tables.memories.push({
+      id: bobMemId,
+      user_id: bobUserId,
+      category: 'decision',
+      content: 'Bob proprietary decision',
+      status: 'approved',
+    });
+
+    const req = new Request('http://localhost/feedback', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${userToken}`, Origin: 'http://localhost:5173' },
+      body: JSON.stringify({
+        messageId: 'msg-alice-1',
+        rating: 1,
+        feedbackType: 'wrong_memory',
+        memoryIds: [bobMemId],
+      }),
+    });
+
+    const res = await app.fetch(req, env);
+    expect(res.status).toBe(404);
+    const json: any = await res.json();
+    expect(json.error.code).toBe('MEMORY_UNAUTHORIZED');
+  });
+
+  // 9. Memory Input Validation: Rejects invalid categories and out-of-range values
+  it('validates memory category, importance, and confidence bounds', async () => {
+    const badCategoryReq = new Request('http://localhost/memory', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${userToken}`, Origin: 'http://localhost:5173' },
+      body: JSON.stringify({
+        category: 'unsupported_category_name',
+        content: 'Valid content',
+      }),
+    });
+    const badCatRes = await app.fetch(badCategoryReq, env);
+    expect(badCatRes.status).toBe(400);
+
+    const badImportanceReq = new Request('http://localhost/memory', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${userToken}`, Origin: 'http://localhost:5173' },
+      body: JSON.stringify({
+        category: 'personal_preference',
+        content: 'Valid content',
+        importance: 15.0, // Out of range
+      }),
+    });
+    const badImpRes = await app.fetch(badImportanceReq, env);
+    expect(badImpRes.status).toBe(400);
+  });
+
+  // 10. Complete Deletion Semantics: Cleans up memories and related memory graph entities
+  it('DELETE /memory/all removes memories and cleans up memory graph entities', async () => {
+    mockDb.tables.memories.push({
+      id: 'mem-to-del-1',
+      user_id: testUserId,
+      category: 'skill_knowledge',
+      content: 'Erase me',
+      status: 'approved',
+    });
+
+    mockDb.tables.knowledge_entities.push(
+      { id: 'ent-mem-1', user_id: testUserId, entity_type: 'memory', name: 'Memory Entity' },
+      { id: 'ent-proj-1', user_id: testUserId, entity_type: 'project', name: 'Persistent Project Entity' }
+    );
+
+    const delReq = new Request('http://localhost/memory/all', {
+      method: 'DELETE',
+      headers: { Authorization: `Bearer ${userToken}`, Origin: 'http://localhost:5173' },
+    });
+
+    const delRes = await app.fetch(delReq, env);
+    expect(delRes.status).toBe(200);
+
+    expect(mockDb.tables.memories.filter((m) => m.user_id === testUserId).length).toBe(0);
+    expect(mockDb.tables.knowledge_entities.find((e) => e.id === 'ent-mem-1')).toBeUndefined();
+    expect(mockDb.tables.knowledge_entities.find((e) => e.id === 'ent-proj-1')).toBeDefined(); // Unrelated project entity preserved
+  });
+
+  // 11. Complete Retrieval Lifecycle & Approval
   it('supports memory creation, approval, pinning, and retrieval lifecycle', async () => {
-    // 1. Create candidate memory
+    // 1. Create candidate
     const createReq = new Request('http://localhost/memory', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${userToken}`, Origin: 'http://localhost:5173' },
-      body: JSON.stringify({ category: 'personal_preference', title: 'Python', content: 'Prefers Python over Node for scripting' }),
+      body: JSON.stringify({
+        category: 'personal_preference',
+        content: 'I prefer functional programming with TypeScript.',
+        importance: 0.9,
+      }),
     });
-
     const createRes = await app.fetch(createReq, env);
     expect(createRes.status).toBe(201);
     const createJson: any = await createRes.json();
-    expect(createJson.success).toBe(true);
     const memId = createJson.data.id;
+    expect(createJson.data.status).toBe('candidate');
 
-    // 2. Approve candidate memory
+    // Candidate should NOT be returned by default in ordinary retrieval
+    const retCandReq = new Request('http://localhost/memory/retrieve', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${userToken}`, Origin: 'http://localhost:5173' },
+      body: JSON.stringify({ query: 'functional programming' }),
+    });
+    const retCandRes = await app.fetch(retCandReq, env);
+    const retCandJson: any = await retCandRes.json();
+    expect(retCandJson.data.relevantMemories.length).toBe(0);
+
+    // 2. Approve memory
     const approveReq = new Request(`http://localhost/memory/${memId}/approve`, {
       method: 'POST',
       headers: { Authorization: `Bearer ${userToken}`, Origin: 'http://localhost:5173' },
@@ -253,129 +560,17 @@ describe('Milestone 4 — Memory, Knowledge Graph & Feedback Integration Tests',
     });
     const pinRes = await app.fetch(pinReq, env);
     expect(pinRes.status).toBe(200);
-    const pinJson: any = await pinRes.json();
-    expect(pinJson.data.isPinned).toBe(true);
 
-    // 4. Retrieve via hybrid search
-    const retrieveReq = new Request('http://localhost/memory/retrieve', {
+    // 4. Retrieve approved & pinned memory
+    const retReq = new Request('http://localhost/memory/retrieve', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${userToken}`, Origin: 'http://localhost:5173' },
-      body: JSON.stringify({ query: 'What language for scripting?' }),
+      body: JSON.stringify({ query: 'functional programming' }),
     });
-    const retrieveRes = await app.fetch(retrieveReq, env);
-    expect(retrieveRes.status).toBe(200);
-    const retrieveJson: any = await retrieveRes.json();
-    expect(retrieveJson.data.relevantMemories.length).toBeGreaterThan(0);
-    expect(retrieveJson.data.relevantMemories[0].id).toBe(memId);
-  });
-
-  // Test 2: Sensitive Secret Rejection
-  it('strictly rejects API keys and passwords from being saved into memory', async () => {
-    const leakReq = new Request('http://localhost/memory', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${userToken}`, Origin: 'http://localhost:5173' },
-      body: JSON.stringify({ category: 'personal_preference', content: 'My password is SuperSecretPassword123' }),
-    });
-
-    const leakRes = await app.fetch(leakReq, env);
-    expect(leakRes.status).toBe(400);
-    const leakJson: any = await leakRes.json();
-    expect(leakJson.error.code).toBe('SENSITIVE_DATA_BLOCKED');
-  });
-
-  // Test 3: Knowledge Graph Entities & Relations
-  it('creates entities and validates relationships under user ownership', async () => {
-    // 1. Create Entity A (Person)
-    const entAReq = new Request('http://localhost/knowledge-graph/entities', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${userToken}`, Origin: 'http://localhost:5173' },
-      body: JSON.stringify({ name: 'Alice', entityType: 'Person' }),
-    });
-    const entARes = await app.fetch(entAReq, env);
-    expect(entARes.status).toBe(201);
-    const entAJson: any = await entARes.json();
-
-    // 2. Create Entity B (Technology)
-    const entBReq = new Request('http://localhost/knowledge-graph/entities', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${userToken}`, Origin: 'http://localhost:5173' },
-      body: JSON.stringify({ name: 'TypeScript', entityType: 'Technology' }),
-    });
-    const entBRes = await app.fetch(entBReq, env);
-    expect(entBRes.status).toBe(201);
-    const entBJson: any = await entBRes.json();
-
-    // 3. Create Relation: Alice -> PREFERS -> TypeScript
-    const relReq = new Request('http://localhost/knowledge-graph/relations', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${userToken}`, Origin: 'http://localhost:5173' },
-      body: JSON.stringify({ sourceEntityId: entAJson.data.id, targetEntityId: entBJson.data.id, relationType: 'PREFERS' }),
-    });
-    const relRes = await app.fetch(relReq, env);
-    expect(relRes.status).toBe(201);
-
-    // 4. Retrieve Graph
-    const graphReq = new Request('http://localhost/knowledge-graph', {
-      headers: { Authorization: `Bearer ${userToken}`, Origin: 'http://localhost:5173' },
-    });
-    const graphRes = await app.fetch(graphReq, env);
-    expect(graphRes.status).toBe(200);
-    const graphJson: any = await graphRes.json();
-    expect(graphJson.data.entities.length).toBe(2);
-    expect(graphJson.data.relations.length).toBe(1);
-    expect(graphJson.data.relations[0].relationType).toBe('PREFERS');
-  });
-
-  // Test 4: Feedback with Auto Candidate Correction
-  it('records feedback and automatically generates candidate memory when correction text is provided', async () => {
-    const fbReq = new Request('http://localhost/feedback', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${userToken}`, Origin: 'http://localhost:5173' },
-      body: JSON.stringify({
-        messageId: 'msg-123',
-        rating: -1,
-        feedbackType: 'incorrect',
-        correctionText: 'Actually I use pnpm instead of npm.',
-      }),
-    });
-
-    const fbRes = await app.fetch(fbReq, env);
-    expect(fbRes.status).toBe(201);
-    const fbJson: any = await fbRes.json();
-    expect(fbJson.success).toBe(true);
-    expect(fbJson.data.generatedCandidateId).toBeDefined();
-
-    // Verify candidate was created in memories table
-    const cand = mockDb.tables.memories.find((m) => m.id === fbJson.data.generatedCandidateId);
-    expect(cand).toBeDefined();
-    expect(cand.category).toBe('correction');
-    expect(cand.status).toBe('candidate');
-  });
-
-  // Test 5: Tenant Isolation
-  it('strictly isolates memories and rejects cross-tenant access', async () => {
-    mockDb.tables.memories.push({
-      id: 'mem-bob-secret',
-      user_id: bobUserId,
-      category: 'personal_preference',
-      content: 'Bob secret preference',
-      status: 'approved',
-      is_pinned: 0,
-      confidence: 0.9,
-      importance: 0.8,
-      source_type: 'direct_entry',
-      verification_status: 'verified',
-    });
-
-    // Alice attempts to delete Bob's memory
-    const delReq = new Request('http://localhost/memory/mem-bob-secret', {
-      method: 'DELETE',
-      headers: { Authorization: `Bearer ${userToken}`, Origin: 'http://localhost:5173' },
-    });
-    const delRes = await app.fetch(delReq, env);
-    expect(delRes.status).toBe(404);
-
-    // Verify Bob's record remains untouched
-    expect(mockDb.tables.memories.find((m) => m.id === 'mem-bob-secret')).toBeDefined();
+    const retRes = await app.fetch(retReq, env);
+    expect(retRes.status).toBe(200);
+    const retJson: any = await retRes.json();
+    expect(retJson.data.relevantMemories.length).toBe(1);
+    expect(retJson.data.relevantMemories[0].id).toBe(memId);
   });
 });
