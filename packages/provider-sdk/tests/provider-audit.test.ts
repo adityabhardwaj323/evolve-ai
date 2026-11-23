@@ -157,4 +157,77 @@ describe('Milestone 3.1 — Complete Provider Adapters Audit & Verification Test
     expect(models.length).toBe(2);
     expect(models[0].id).toBe('meta-llama/llama-3.3-70b-instruct');
   });
+
+  // Milestone 3.2 Tests
+  it('GeminiAdapter: uses x-goog-api-key header and never leaks API key in request URL', async () => {
+    const adapter = new GeminiAdapter();
+    const testKey = 'AIzaSySecretGeminiKey12345';
+
+    let capturedUrl = '';
+    let capturedHeaders: any = {};
+
+    global.fetch = vi.fn().mockImplementation(async (url: string, init?: RequestInit) => {
+      capturedUrl = url;
+      capturedHeaders = init?.headers || {};
+      return {
+        ok: true,
+        json: async () => ({
+          candidates: [{ content: { parts: [{ text: 'Gemini header auth response' }] } }],
+          usageMetadata: { promptTokenCount: 6, candidatesTokenCount: 4 },
+        }),
+      };
+    });
+
+    const res = await adapter.generateText(testKey, {
+      model: 'gemini-1.5-flash',
+      messages: [{ role: 'user', content: 'hello' }],
+    });
+
+    expect(capturedUrl).not.toContain(testKey);
+    expect(capturedUrl).not.toContain('key=');
+    expect(capturedHeaders['x-goog-api-key']).toBe(testKey);
+    expect(res.content).toBe('Gemini header auth response');
+  });
+
+  it('GeminiAdapter: redacts API key from error messages and logs', async () => {
+    const adapter = new GeminiAdapter();
+    const testKey = 'AIzaSySecretGeminiKeyToRedact';
+
+    global.fetch = vi.fn().mockImplementation(async () => {
+      return {
+        ok: false,
+        status: 400,
+        json: async () => ({
+          error: { message: `Invalid API key provided: ${testKey} for project` },
+        }),
+      };
+    });
+
+    await expect(
+      adapter.generateText(testKey, {
+        model: 'gemini-1.5-flash',
+        messages: [{ role: 'user', content: 'test' }],
+      })
+    ).rejects.toThrowError(/\[REDACTED_API_KEY\]/);
+  });
+
+  it('Static catalogues: presented as stale/fallback with unknown status and verification dates', () => {
+    const gemini = new GeminiAdapter();
+    const claude = new ClaudeAdapter();
+    const openai = new OpenAIAdapter();
+
+    const gModels = gemini.listStaticModels();
+    expect(gModels[0].isFallback).toBe(true);
+    expect(gModels[0].status).toBe('unknown');
+    expect(gModels[0].lastVerifiedDate).toBeDefined();
+
+    const cModels = claude.listStaticModels();
+    expect(cModels[0].isFallback).toBe(true);
+    expect(cModels[0].status).toBe('unknown');
+    expect(cModels[0].lastVerifiedDate).toBeDefined();
+
+    const oModels = openai.listStaticModels();
+    expect(oModels[0].isFallback).toBe(true);
+    expect(oModels[0].status).toBe('unknown');
+  });
 });

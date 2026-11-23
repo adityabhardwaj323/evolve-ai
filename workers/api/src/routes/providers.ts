@@ -231,27 +231,49 @@ providersRouter.post('/credentials/:id/test', async (c) => {
 });
 
 /**
+ * In-memory guard to prevent duplicate concurrent smoke test submissions
+ * Key: `user_{userId}_cred_{credentialId}`
+ */
+const activeSmokeTests = new Set<string>();
+
+/**
  * POST /providers/credentials/:id/smoke-test
- * Optional user-triggered live smoke test (Tests Auth, Generation, Streaming, Usage, Error Handling)
+ * User-triggered: "Provider Connection & Generation Test — May Incur API Charges"
+ * Selectable operations:
+ * - 'auth': Lightweight model discovery (no generation tokens charged by provider)
+ * - 'generation': Single minimal text generation (incurs minimal API tokens)
+ * - 'streaming': Minimal streaming token verification (incurs minimal API tokens)
  */
 providersRouter.post('/credentials/:id/smoke-test', async (c) => {
   const user = c.get('user');
   const credentialId = c.req.param('id');
+  const body = await c.req.json().catch(() => ({}));
 
-  const cred = await c.env.DB
-    .prepare(
-      `SELECT id, provider_type, default_model, encrypted_key, key_iv, encryption_version, custom_endpoint
-       FROM provider_credentials
-       WHERE id = ? AND user_id = ?`
-    )
-    .bind(credentialId, user.id)
-    .first<any>();
-
-  if (!cred) {
-    return c.json({ success: false, error: { code: 'NOT_FOUND', message: 'Credential not found or unauthorized.' } }, 404);
+  // Duplicate submission protection
+  const testKey = `user_${user.id}_cred_${credentialId}`;
+  if (activeSmokeTests.has(testKey)) {
+    return c.json({
+      success: false,
+      error: { code: 'TEST_IN_PROGRESS', message: 'A test is already running for this credential. Please wait for it to complete.' },
+    }, 429);
   }
 
+  activeSmokeTests.add(testKey);
+
   try {
+    const cred = await c.env.DB
+      .prepare(
+        `SELECT id, provider_type, default_model, encrypted_key, key_iv, encryption_version, custom_endpoint
+         FROM provider_credentials
+         WHERE id = ? AND user_id = ?`
+      )
+      .bind(credentialId, user.id)
+      .first<any>();
+
+    if (!cred) {
+      return c.json({ success: false, error: { code: 'NOT_FOUND', message: 'Credential not found or unauthorized.' } }, 404);
+    }
+
     const rawKey = await decryptCredential(
       {
         encryptedKey: cred.encrypted_key,
@@ -264,55 +286,72 @@ providersRouter.post('/credentials/:id/smoke-test', async (c) => {
 
     const adapter = registry.get(cred.provider_type);
 
-    // 1. Test Auth
-    const authRes = await adapter.validateCredentials(rawKey, cred.custom_endpoint);
-    if (!authRes.valid) {
-      return c.json({ success: false, error: { code: 'AUTH_FAILED', message: authRes.error } }, 400);
+    // Operations to perform (default to auth, generation, streaming if none provided)
+    const ops: string[] = Array.isArray(body.operations) && body.operations.length > 0
+      ? body.operations
+      : ['auth', 'generation', 'streaming'];
+
+    const testResults: Record<string, any> = {
+      provider: cred.provider_type,
+      model: cred.default_model,
+      testName: 'Provider Connection & Generation Test — May Incur API Charges',
+      costWarningAcknowledged: true,
+      timestamp: new Date().toISOString(),
+    };
+
+    // 1. Auth & Model Discovery Check
+    if (ops.includes('auth')) {
+      const authRes = await adapter.validateCredentials(rawKey, cred.custom_endpoint);
+      if (!authRes.valid) {
+        return c.json({ success: false, error: { code: 'AUTH_FAILED', message: authRes.error } }, 400);
+      }
+      testResults.authStatus = 'passed';
     }
 
-    // 2. Test Generation (minimal token call)
-    const genRes = await adapter.generateText(
-      rawKey,
-      {
-        model: cred.default_model,
-        messages: [{ role: 'user', content: 'Respond with the word "pong".' }],
-        maxTokens: 10,
-        temperature: 0,
-      },
-      cred.customEndpoint
-    );
+    // 2. Text Generation Check (Minimal tokens: 5-10 max)
+    if (ops.includes('generation')) {
+      const genRes = await adapter.generateText(
+        rawKey,
+        {
+          model: cred.default_model,
+          messages: [{ role: 'user', content: 'Respond with the word "pong".' }],
+          maxTokens: 10,
+          temperature: 0,
+        },
+        cred.custom_endpoint
+      );
+      testResults.generationStatus = 'passed';
+      testResults.sampleResponse = genRes.content;
+      testResults.tokensReported = genRes.usage?.totalTokens || 0;
+    }
 
-    // 3. Test Streaming
-    let streamChunks = 0;
-    await adapter.streamText(
-      rawKey,
-      {
-        model: cred.default_model,
-        messages: [{ role: 'user', content: 'Say "hello world".' }],
-        maxTokens: 10,
-        temperature: 0,
-      },
-      (event) => {
-        if (event.type === 'content_delta') streamChunks++;
-      },
-      cred.customEndpoint
-    );
+    // 3. Streaming Generation Check (Minimal tokens)
+    if (ops.includes('streaming')) {
+      let streamChunks = 0;
+      await adapter.streamText(
+        rawKey,
+        {
+          model: cred.default_model,
+          messages: [{ role: 'user', content: 'Say "hello world".' }],
+          maxTokens: 10,
+          temperature: 0,
+        },
+        (event) => {
+          if (event.type === 'content_delta') streamChunks++;
+        },
+        cred.custom_endpoint
+      );
+      testResults.streamingStatus = streamChunks > 0 ? 'passed' : 'verified_buffered';
+    }
 
     return c.json({
       success: true,
-      data: {
-        provider: cred.provider_type,
-        model: cred.default_model,
-        authStatus: 'passed',
-        generationStatus: 'passed',
-        sampleResponse: genRes.content,
-        tokensReported: genRes.usage?.totalTokens || 0,
-        streamingStatus: streamChunks > 0 ? 'passed' : 'verified_buffered',
-        timestamp: new Date().toISOString(),
-      },
+      data: testResults,
     });
   } catch (err: any) {
     return c.json({ success: false, error: { code: 'SMOKE_TEST_FAILED', message: err.message } }, 500);
+  } finally {
+    activeSmokeTests.delete(testKey);
   }
 });
 

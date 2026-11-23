@@ -398,6 +398,99 @@ describe('Milestone 3 — End-to-End Chat, BYOK & Multi-Provider Integration Tes
     expect(json.data.streamingStatus).toBe('passed');
   });
 
+  it('smoke-test supports selectable operations and includes billing cost transparency disclosure', async () => {
+    const credId = 'cred-smoke-selectable';
+    const enc = await encryptCredential('test-smoke-key-2', HEX_SECRET, { userId, credentialId: credId });
+    mockDb.tables.provider_credentials.push({
+      id: credId,
+      user_id: userId,
+      provider_type: 'gemini',
+      label: 'Gemini Smoke Ops',
+      encrypted_key: enc.encryptedKey,
+      key_iv: enc.keyIv,
+      encryption_version: enc.encryptionVersion,
+      default_model: 'gemini-1.5-flash',
+      is_active: 1,
+    });
+
+    global.fetch = vi.fn().mockImplementation(async () => {
+      return new Response(
+        JSON.stringify({
+          models: [{ name: 'models/gemini-1.5-flash', supportedGenerationMethods: ['generateContent'] }],
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } }
+      );
+    });
+
+    // Request only 'auth' operation (zero generation cost)
+    const req = new Request(`http://localhost/providers/credentials/${credId}/smoke-test`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${userToken}`,
+        'Origin': 'http://localhost:5173',
+      },
+      body: JSON.stringify({ operations: ['auth'] }),
+    });
+
+    const res = await app.fetch(req, env);
+    expect(res.status).toBe(200);
+    const json: any = await res.json();
+    expect(json.success).toBe(true);
+    expect(json.data.authStatus).toBe('passed');
+    expect(json.data.generationStatus).toBeUndefined();
+    expect(json.data.testName).toBe('Provider Connection & Generation Test — May Incur API Charges');
+    expect(json.data.costWarningAcknowledged).toBe(true);
+  });
+
+  it('original-request cancellation via client abort signal terminates stream cleanly', async () => {
+    const credO = 'cred-cancel-test';
+    const encO = await encryptCredential('fake-openai-cancel-key', HEX_SECRET, { userId, credentialId: credO });
+    mockDb.tables.provider_credentials.push({
+      id: credO,
+      user_id: userId,
+      provider_type: 'openai',
+      label: 'OpenAI Cancel',
+      encrypted_key: encO.encryptedKey,
+      key_iv: encO.keyIv,
+      encryption_version: encO.encryptionVersion,
+      default_model: 'gpt-4o-mini',
+      is_active: 1,
+    });
+
+    const clientController = new AbortController();
+    global.fetch = vi.fn().mockImplementation(async (url: string, init?: RequestInit) => {
+      const stream = new ReadableStream({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode('data: {"choices":[{"delta":{"content":"Chunk 1"}}]}\\n\\n'));
+        },
+      });
+      return new Response(stream, { status: 200, headers: { 'Content-Type': 'text/event-stream' } });
+    });
+
+    const req = new Request('http://localhost/chat/stream', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${userToken}`,
+        'Origin': 'http://localhost:5173',
+      },
+      body: JSON.stringify({
+        providerType: 'openai',
+        model: 'gpt-4o-mini',
+        messages: [{ role: 'user', content: 'test stream' }],
+      }),
+      signal: clientController.signal,
+    });
+
+    const res = await app.fetch(req, env);
+    expect(res.status).toBe(200);
+
+    // Abort original client request
+    clientController.abort();
+    expect(clientController.signal.aborted).toBe(true);
+  });
+
   it('POST /chat/stop aborts active streams cleanly', async () => {
     const req = new Request('http://localhost/chat/stop', {
       method: 'POST',

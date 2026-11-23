@@ -85,11 +85,31 @@
   - Failure or timeout in Model A does not abort or corrupt Model B's output.
 - [x] Production User-Triggered Smoke Test Endpoint:
   - Created `POST /providers/credentials/:id/smoke-test` allowing users to run an on-demand 4-stage health test (Auth, Text Generation, SSE Streaming, Usage Accounting) without background or automatic billing.
-- [x] Comprehensive Automated Test Coverage:
-  - 12 provider SDK unit tests (`vitest run`).
+
+### Milestone 3.2: Final Security & Reliability Patch
+- [x] Header-Based Gemini Authentication:
+  - Replaced query-string authentication (`?key=...`) with standard `x-goog-api-key` header for all requests (model discovery, text generation, and streaming generation).
+  - Ensured API keys are omitted from all URLs and query parameters.
+  - Added regex-based credential redaction in `GeminiAdapter.sanitizeError()` replacing any inadvertent key occurrences in error responses or logs with `[REDACTED_API_KEY]`.
+- [x] Isolate-Independent Cancellation Lifecycle:
+  - Removed reliance on cross-isolate in-memory maps for stream abort coordination.
+  - Bound the frontend `AbortController` cancellation directly to the original streaming HTTP request.
+  - Cloudflare Worker's `c.req.raw.signal` propagates client disconnects directly into the upstream provider fetch signal.
+  - Hardened streaming reader cleanup: explicitly calls `reader.cancel()` and `reader.releaseLock()` upon abort or error, cleanly releasing underlying network sockets.
+  - Persists partial assistant responses to Cloudflare D1 if user stops generation mid-stream.
+- [x] Smoke-Test Cost Transparency & UX:
+  - Rebranded smoke test UI and backend to: `"Provider Connection & Generation Test — May Incur API Charges"`.
+  - Provided selectable operations: `auth` (free model discovery), `generation` (single minimal text generation), and `streaming` (SSE stream verification).
+  - Disclosed upfront billing warnings before any generation test.
+  - Implemented duplicate concurrent submission protection via `activeSmokeTests` in `POST /providers/credentials/:id/smoke-test`.
+- [x] Model Catalogue Fallback Freshness:
+  - Marked static fallback catalogues with realistic verification dates (`2024-11-01`) and status `unknown`.
+  - Stated explicitly that fallback presence does not guarantee user key access or current availability.
+- [x] Automated Test Verification:
+  - 15 provider SDK unit tests (`vitest run`).
   - 27 Web Crypto security unit tests (`tsx tests/security.test.ts`).
-  - 15 end-to-end integration tests (`vitest run`).
-  - 100% monorepo typecheck and production build passing.
+  - 17 end-to-end integration tests (`vitest run`).
+  - 100% typecheck and production build passing.
 
 ### Milestone 4: AI Workspace
 - [ ] Chat conversation persistence in D1.

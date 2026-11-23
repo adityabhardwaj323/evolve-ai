@@ -11,10 +11,18 @@ chatRouter.use('*', requireAuth);
 const registry = ProviderRegistry.getInstance();
 
 /**
- * In-memory map of active abort controllers for stream cancellation
- * Key format: `user_{userId}_conv_{conversationId}`
+ * Note on Cross-Isolate Stream Cancellation:
+ * In Cloudflare Workers, requests can be routed to different isolates.
+ * Therefore, reliable stream cancellation is achieved directly via the original
+ * streaming HTTP connection's `c.req.raw.signal`. When the client closes or aborts
+ * the streaming request, `c.req.raw.signal` emits 'abort', propagating immediately
+ * to the upstream provider fetch and terminating the connection.
+ *
+ * An in-memory Map (`localActiveGenerations`) is retained strictly as a best-effort
+ * fallback within the same isolate for the optional POST /chat/stop endpoint,
+ * but users and frontend clients MUST abort the original streaming request directly.
  */
-const activeGenerations = new Map<string, AbortController>();
+const localActiveGenerations = new Map<string, AbortController>();
 
 /**
  * Helper to fetch and decrypt a user's active credential for a given providerType
@@ -182,12 +190,13 @@ chatRouter.post('/stream', async (c) => {
   // Setup abort controller for upstream cancellation
   const upstreamController = new AbortController();
   const generationKey = `user_${user.id}_conv_${conversationId || 'standalone'}`;
-  activeGenerations.set(generationKey, upstreamController);
+  localActiveGenerations.set(generationKey, upstreamController);
 
-  // If client disconnects, abort upstream request immediately
+  // If client disconnects (network drop, tab close, or frontend AbortController),
+  // abort upstream provider request immediately without relying on cross-isolate state
   c.req.raw.signal.addEventListener('abort', () => {
     upstreamController.abort();
-    activeGenerations.delete(generationKey);
+    localActiveGenerations.delete(generationKey);
   });
 
   const { readable, writable } = new TransformStream();
@@ -231,48 +240,6 @@ chatRouter.post('/stream', async (c) => {
 
       fullResponseText = response.content;
       finalUsage = response.usage || finalUsage;
-
-      if (conversationId && fullResponseText) {
-        const lastUserMsg = messages[messages.length - 1];
-        if (lastUserMsg && lastUserMsg.role === 'user') {
-          await c.env.DB.prepare(
-            `INSERT INTO messages (id, conversation_id, user_id, role, content, model, provider_type, created_at)
-             VALUES (?, ?, ?, 'user', ?, ?, ?, CURRENT_TIMESTAMP)`
-          ).bind(crypto.randomUUID(), conversationId, user.id, lastUserMsg.content, model, providerType).run();
-        }
-
-        await c.env.DB.prepare(
-          `INSERT INTO messages (id, conversation_id, user_id, role, content, model, provider_type, token_count, created_at)
-           VALUES (?, ?, ?, 'assistant', ?, ?, ?, ?, CURRENT_TIMESTAMP)`
-        ).bind(
-          crypto.randomUUID(),
-          conversationId,
-          user.id,
-          fullResponseText,
-          model,
-          providerType,
-          finalUsage?.totalTokens || 0
-        ).run();
-
-        await c.env.DB.prepare('UPDATE conversations SET updated_at = CURRENT_TIMESTAMP WHERE id = ? AND user_id = ?')
-          .bind(conversationId, user.id).run();
-      }
-
-      if (finalUsage) {
-        await c.env.DB.prepare(
-          `INSERT INTO usage_events (id, user_id, conversation_id, provider_type, model, prompt_tokens, completion_tokens, total_tokens, success, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, CURRENT_TIMESTAMP)`
-        ).bind(
-          crypto.randomUUID(),
-          user.id,
-          conversationId || null,
-          providerType,
-          model,
-          finalUsage.promptTokens,
-          finalUsage.completionTokens,
-          finalUsage.totalTokens
-        ).run();
-      }
     } catch (err: any) {
       if (err.name === 'AbortError' || upstreamController.signal.aborted) {
         await sendEvent({ type: 'content_delta', content: '\n\n[Generation stopped by user]' });
@@ -280,9 +247,65 @@ chatRouter.post('/stream', async (c) => {
         await sendEvent({ type: 'error', error: err.message || 'Stream processing failed' });
       }
     } finally {
-      activeGenerations.delete(generationKey);
-      await writer.write(encoder.encode('data: [DONE]\n\n'));
-      await writer.close();
+      localActiveGenerations.delete(generationKey);
+
+      // Persist partial or full response if any content was received before completion/abort
+      if (conversationId && fullResponseText) {
+        try {
+          const lastUserMsg = messages[messages.length - 1];
+          if (lastUserMsg && lastUserMsg.role === 'user') {
+            await c.env.DB.prepare(
+              `INSERT INTO messages (id, conversation_id, user_id, role, content, model, provider_type, created_at)
+               VALUES (?, ?, ?, 'user', ?, ?, ?, CURRENT_TIMESTAMP)`
+            ).bind(crypto.randomUUID(), conversationId, user.id, lastUserMsg.content, model, providerType).run();
+          }
+
+          await c.env.DB.prepare(
+            `INSERT INTO messages (id, conversation_id, user_id, role, content, model, provider_type, token_count, created_at)
+             VALUES (?, ?, ?, 'assistant', ?, ?, ?, ?, CURRENT_TIMESTAMP)`
+          ).bind(
+            crypto.randomUUID(),
+            conversationId,
+            user.id,
+            fullResponseText,
+            model,
+            providerType,
+            finalUsage?.totalTokens || 0
+          ).run();
+
+          await c.env.DB.prepare('UPDATE conversations SET updated_at = CURRENT_TIMESTAMP WHERE id = ? AND user_id = ?')
+            .bind(conversationId, user.id).run();
+        } catch {
+          // ignore DB error during abort
+        }
+      }
+
+      if (finalUsage) {
+        try {
+          await c.env.DB.prepare(
+            `INSERT INTO usage_events (id, user_id, conversation_id, provider_type, model, prompt_tokens, completion_tokens, total_tokens, success, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, CURRENT_TIMESTAMP)`
+          ).bind(
+            crypto.randomUUID(),
+            user.id,
+            conversationId || null,
+            providerType,
+            model,
+            finalUsage.promptTokens,
+            finalUsage.completionTokens,
+            finalUsage.totalTokens
+          ).run();
+        } catch {
+          // ignore usage logging error
+        }
+      }
+
+      try {
+        await writer.write(encoder.encode('data: [DONE]\n\n'));
+        await writer.close();
+      } catch {
+        // stream already closed by client abort
+      }
     }
   })();
 
@@ -306,14 +329,19 @@ chatRouter.post('/stop', async (c) => {
   const conversationId = body.conversationId || 'standalone';
   const generationKey = `user_${user.id}_conv_${conversationId}`;
 
-  const controller = activeGenerations.get(generationKey);
+  const controller = localActiveGenerations.get(generationKey);
   if (controller) {
     controller.abort();
-    activeGenerations.delete(generationKey);
-    return c.json({ success: true, data: { message: 'Generation aborted successfully.' } });
+    localActiveGenerations.delete(generationKey);
+    return c.json({ success: true, data: { message: 'Generation aborted successfully on local isolate.' } });
   }
 
-  return c.json({ success: true, data: { message: 'No active generation found to abort.' } });
+  return c.json({
+    success: true,
+    data: {
+      message: 'No active generation found on local isolate. Stream cancellation should be triggered via original request abort signal.',
+    },
+  });
 });
 
 /**

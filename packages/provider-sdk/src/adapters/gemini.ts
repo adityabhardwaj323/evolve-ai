@@ -44,8 +44,8 @@ export class GeminiAdapter implements IProviderAdapter {
         description: 'Fast, versatile performance across a diverse variety of multimodal tasks.',
         isDefault: true,
         isFallback: true,
-        lastVerifiedDate: '2026-11-23',
-        status: 'active',
+        lastVerifiedDate: '2024-11-01',
+        status: 'unknown',
       },
       {
         id: 'gemini-1.5-pro',
@@ -54,8 +54,8 @@ export class GeminiAdapter implements IProviderAdapter {
         contextWindow: 2097152,
         description: 'Mid-size multimodal model optimized for complex reasoning tasks.',
         isFallback: true,
-        lastVerifiedDate: '2026-11-23',
-        status: 'active',
+        lastVerifiedDate: '2024-11-01',
+        status: 'unknown',
       },
       {
         id: 'gemini-2.0-flash-exp',
@@ -64,24 +64,42 @@ export class GeminiAdapter implements IProviderAdapter {
         contextWindow: 1048576,
         description: 'Next-generation multimodal model with low latency and real-time streaming.',
         isFallback: true,
-        lastVerifiedDate: '2026-11-23',
-        status: 'active',
+        lastVerifiedDate: '2024-11-01',
+        status: 'unknown',
       },
     ];
   }
 
+  /**
+   * Helper to redact sensitive credentials from error messages or logs
+   */
+  private sanitizeError(errMessage: string, apiKey: string): string {
+    if (!apiKey) return errMessage;
+    // Replace raw key or URL-encoded key if present in error message
+    const escapedKey = apiKey.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const encodedKey = encodeURIComponent(apiKey).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    return errMessage
+      .replace(new RegExp(escapedKey, 'g'), '[REDACTED_API_KEY]')
+      .replace(new RegExp(encodedKey, 'g'), '[REDACTED_API_KEY]');
+  }
+
   async validateCredentials(apiKey: string): Promise<{ valid: boolean; error?: string }> {
     try {
-      const url = `https://generativelanguage.googleapis.com/v1beta/models?key=${encodeURIComponent(apiKey)}`;
-      const res = await fetch(url);
+      // Use official x-goog-api-key header; do not append key to URL query string
+      const url = `https://generativelanguage.googleapis.com/v1beta/models`;
+      const res = await fetch(url, {
+        headers: {
+          'x-goog-api-key': apiKey,
+        },
+      });
       if (!res.ok) {
         const errorJson = await res.json().catch(() => ({}));
-        const msg = (errorJson as any)?.error?.message || `HTTP ${res.status}: Validation failed`;
-        return { valid: false, error: msg };
+        const rawMsg = (errorJson as any)?.error?.message || `HTTP ${res.status}: Validation failed`;
+        return { valid: false, error: this.sanitizeError(rawMsg, apiKey) };
       }
       return { valid: true };
     } catch (err: any) {
-      return { valid: false, error: err.message || 'Network error reaching Gemini endpoint' };
+      return { valid: false, error: this.sanitizeError(err.message || 'Network error reaching Gemini endpoint', apiKey) };
     }
   }
 
@@ -93,12 +111,16 @@ export class GeminiAdapter implements IProviderAdapter {
 
       while (pageCount < 5) {
         pageCount++;
-        let url = `https://generativelanguage.googleapis.com/v1beta/models?pageSize=50&key=${encodeURIComponent(apiKey)}`;
+        let url = `https://generativelanguage.googleapis.com/v1beta/models?pageSize=50`;
         if (pageToken) {
           url += `&pageToken=${encodeURIComponent(pageToken)}`;
         }
 
-        const res = await fetch(url);
+        const res = await fetch(url, {
+          headers: {
+            'x-goog-api-key': apiKey,
+          },
+        });
         if (!res.ok) {
           return this.listStaticModels();
         }
@@ -147,7 +169,8 @@ export class GeminiAdapter implements IProviderAdapter {
   }
 
   async generateText(apiKey: string, options: ProviderRequestOptions): Promise<ProviderResponse> {
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(options.model)}:generateContent?key=${encodeURIComponent(apiKey)}`;
+    // Official header-based authentication without query string key
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(options.model)}:generateContent`;
     
     const body: any = {
       contents: this.formatContents(options.messages),
@@ -163,16 +186,25 @@ export class GeminiAdapter implements IProviderAdapter {
       };
     }
 
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-      signal: options.signal,
-    });
+    let res: Response;
+    try {
+      res = await fetch(url, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-goog-api-key': apiKey,
+        },
+        body: JSON.stringify(body),
+        signal: options.signal,
+      });
+    } catch (err: any) {
+      throw new Error(this.sanitizeError(err.message, apiKey));
+    }
 
     if (!res.ok) {
       const errJson: any = await res.json().catch(() => ({}));
-      throw new Error(errJson?.error?.message || `Gemini API returned status ${res.status}`);
+      const rawMsg = errJson?.error?.message || `Gemini API returned status ${res.status}`;
+      throw new Error(this.sanitizeError(rawMsg, apiKey));
     }
 
     const data: any = await res.json();
@@ -199,7 +231,8 @@ export class GeminiAdapter implements IProviderAdapter {
     options: ProviderRequestOptions,
     onEvent: (event: StreamEvent) => void
   ): Promise<ProviderResponse> {
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(options.model)}:streamGenerateContent?alt=sse&key=${encodeURIComponent(apiKey)}`;
+    // Official header-based authentication with alt=sse query parameter only
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(options.model)}:streamGenerateContent?alt=sse`;
 
     const body: any = {
       contents: this.formatContents(options.messages),
@@ -215,16 +248,25 @@ export class GeminiAdapter implements IProviderAdapter {
       };
     }
 
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-      signal: options.signal,
-    });
+    let res: Response;
+    try {
+      res = await fetch(url, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-goog-api-key': apiKey,
+        },
+        body: JSON.stringify(body),
+        signal: options.signal,
+      });
+    } catch (err: any) {
+      throw new Error(this.sanitizeError(err.message, apiKey));
+    }
 
     if (!res.ok) {
       const errJson: any = await res.json().catch(() => ({}));
-      throw new Error(errJson?.error?.message || `Gemini stream error: HTTP ${res.status}`);
+      const rawMsg = errJson?.error?.message || `Gemini stream error: HTTP ${res.status}`;
+      throw new Error(this.sanitizeError(rawMsg, apiKey));
     }
 
     onEvent({ type: 'message_start', model: options.model, provider: 'gemini' });
@@ -277,6 +319,13 @@ export class GeminiAdapter implements IProviderAdapter {
         }
       }
     } finally {
+      try {
+        if (options.signal?.aborted) {
+          await reader.cancel('Stream aborted');
+        }
+      } catch {
+        // ignore cancellation error
+      }
       reader.releaseLock();
     }
 

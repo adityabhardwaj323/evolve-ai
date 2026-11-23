@@ -1052,6 +1052,14 @@ function ProvidersView({
   const [labelInput, setLabelInput] = useState('');
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [testStatus, setTestStatus] = useState<Record<string, string>>({});
+  const [smokeModalCred, setSmokeModalCred] = useState<ProviderCredentialPublic | null>(null);
+  const [smokeOps, setSmokeOps] = useState<{ auth: boolean; generation: boolean; streaming: boolean }>({
+    auth: true,
+    generation: false,
+    streaming: false,
+  });
+  const [smokeRunning, setSmokeRunning] = useState(false);
+  const [smokeResult, setSmokeResult] = useState<any>(null);
 
   const handleOpenConnect = (provider: ProviderMetadata) => {
     setModalProvider(provider);
@@ -1090,6 +1098,30 @@ function ProvidersView({
     } else {
       setTestStatus((prev) => ({ ...prev, [credId]: `error: ${res.error?.message}` }));
     }
+  };
+
+  const handleRunSmokeTest = async () => {
+    if (!smokeModalCred) return;
+    const selectedOps: Array<'auth' | 'generation' | 'streaming'> = [];
+    if (smokeOps.auth) selectedOps.push('auth');
+    if (smokeOps.generation) selectedOps.push('generation');
+    if (smokeOps.streaming) selectedOps.push('streaming');
+
+    if (selectedOps.length === 0) {
+      alert('Please select at least one test operation.');
+      return;
+    }
+
+    setSmokeRunning(true);
+    setSmokeResult(null);
+
+    const res = await ProvidersApi.smokeTestCredential(smokeModalCred.id, selectedOps);
+    if (res.success) {
+      setSmokeResult(res.data);
+    } else {
+      setSmokeResult({ error: res.error?.message || 'Smoke test failed' });
+    }
+    setSmokeRunning(false);
   };
 
   const handleDelete = async (credId: string) => {
@@ -1157,7 +1189,17 @@ function ProvidersView({
                     onClick={() => handleTestKey(cred.id)}
                     className="flex-1 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-medium transition-all"
                   >
-                    Test Connection
+                    Quick Check
+                  </button>
+                  <button
+                    onClick={() => {
+                      setSmokeModalCred(cred);
+                      setSmokeResult(null);
+                      setSmokeOps({ auth: true, generation: false, streaming: false });
+                    }}
+                    className="flex-1 py-1.5 rounded-lg bg-lavender-600/20 hover:bg-lavender-600/30 text-lavender-300 border border-lavender-500/30 text-xs font-medium transition-all"
+                  >
+                    Run Smoke Test
                   </button>
                   <button
                     onClick={() => handleDelete(cred.id)}
@@ -1172,7 +1214,128 @@ function ProvidersView({
         )}
       </div>
 
-      {/* Supported Providers List */}
+      {/* Smoke Test Modal with Cost Warnings */}
+      {smokeModalCred && (
+        <div className="fixed inset-0 z-50 bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-4">
+          <div className="w-full max-w-lg p-6 rounded-2xl bg-slate-900 border border-slate-800 shadow-2xl space-y-5">
+            <div>
+              <h4 className="text-base font-bold text-white flex items-center gap-2">
+                <span>Provider Connection & Generation Test</span>
+              </h4>
+              <p className="text-xs text-amber-400/90 font-medium mt-1">
+                ⚠️ Notice: Generation tests make actual API requests that may incur upstream billing charges against your personal API account.
+              </p>
+            </div>
+
+            <div className="p-3.5 rounded-xl bg-slate-950 border border-slate-800 space-y-2 text-xs">
+              <div className="flex justify-between text-slate-400">
+                <span>Target Provider:</span>
+                <span className="font-semibold text-slate-200 capitalize">{smokeModalCred.providerType}</span>
+              </div>
+              <div className="flex justify-between text-slate-400">
+                <span>Target Model:</span>
+                <span className="font-mono text-lavender-300">{smokeModalCred.defaultModel}</span>
+              </div>
+              <div className="flex justify-between text-slate-400">
+                <span>Key Label:</span>
+                <span className="text-slate-300">{smokeModalCred.label} ({smokeModalCred.maskedKey})</span>
+              </div>
+            </div>
+
+            <div className="space-y-3">
+              <label className="block text-xs font-semibold text-slate-300 uppercase tracking-wider">
+                Selectable Test Operations
+              </label>
+
+              <label className="flex items-start gap-3 p-3 rounded-lg bg-slate-950 border border-slate-800/80 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={smokeOps.auth}
+                  onChange={(e) => setSmokeOps((prev) => ({ ...prev, auth: e.target.checked }))}
+                  className="mt-0.5 rounded border-slate-700 text-lavender-600 focus:ring-0"
+                />
+                <div>
+                  <div className="text-xs font-semibold text-slate-200">1. Authentication & Model Discovery</div>
+                  <div className="text-[11px] text-slate-400">Lightweight check verifying key validity against the Models API (Zero generation tokens charged).</div>
+                </div>
+              </label>
+
+              <label className="flex items-start gap-3 p-3 rounded-lg bg-slate-950 border border-slate-800/80 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={smokeOps.generation}
+                  onChange={(e) => setSmokeOps((prev) => ({ ...prev, generation: e.target.checked }))}
+                  className="mt-0.5 rounded border-slate-700 text-lavender-600 focus:ring-0"
+                />
+                <div>
+                  <div className="text-xs font-semibold text-amber-300">2. Text Generation Test (May incur API charge)</div>
+                  <div className="text-[11px] text-slate-400">Generates a minimal response (max 10 tokens) to verify standard HTTP completion.</div>
+                </div>
+              </label>
+
+              <label className="flex items-start gap-3 p-3 rounded-lg bg-slate-950 border border-slate-800/80 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={smokeOps.streaming}
+                  onChange={(e) => setSmokeOps((prev) => ({ ...prev, streaming: e.target.checked }))}
+                  className="mt-0.5 rounded border-slate-700 text-lavender-600 focus:ring-0"
+                />
+                <div>
+                  <div className="text-xs font-semibold text-amber-300">3. SSE Streaming Test (May incur API charge)</div>
+                  <div className="text-[11px] text-slate-400">Verifies live Server-Sent Events stream chunking and delta emission with minimal tokens.</div>
+                </div>
+              </label>
+            </div>
+
+            {smokeResult && (
+              <div className={`p-4 rounded-xl border text-xs space-y-1.5 ${
+                smokeResult.error
+                  ? 'bg-rose-500/10 border-rose-500/30 text-rose-300'
+                  : 'bg-emerald-500/10 border-emerald-500/30 text-emerald-300'
+              }`}>
+                {smokeResult.error ? (
+                  <div>Error: {smokeResult.error}</div>
+                ) : (
+                  <>
+                    <div className="font-semibold text-white">✓ Smoke Test Completed Successfully</div>
+                    {smokeResult.authStatus && <div>• Auth: {smokeResult.authStatus}</div>}
+                    {smokeResult.generationStatus && <div>• Generation: {smokeResult.generationStatus} (Tokens: {smokeResult.tokensReported})</div>}
+                    {smokeResult.streamingStatus && <div>• Streaming: {smokeResult.streamingStatus}</div>}
+                    {smokeResult.sampleResponse && (
+                      <div className="text-slate-400 italic">Sample: "{smokeResult.sampleResponse}"</div>
+                    )}
+                  </>
+                )}
+              </div>
+            )}
+
+            <div className="flex gap-3 pt-2">
+              <button
+                type="button"
+                onClick={() => setSmokeModalCred(null)}
+                className="flex-1 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs font-semibold text-slate-300"
+              >
+                Close
+              </button>
+              <button
+                type="button"
+                disabled={smokeRunning || (!smokeOps.auth && !smokeOps.generation && !smokeOps.streaming)}
+                onClick={handleRunSmokeTest}
+                className="flex-1 py-2 rounded-lg bg-lavender-600 hover:bg-lavender-500 text-xs font-semibold text-white disabled:opacity-50 flex items-center justify-center gap-2"
+              >
+                {smokeRunning ? (
+                  <>
+                    <RefreshCw className="h-3.5 w-3.5 animate-spin" />
+                    <span>Running Test...</span>
+                  </>
+                ) : (
+                  <span>Execute Test</span>
+                )}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
       <div className="space-y-4">
         <h4 className="text-sm font-semibold text-slate-300 uppercase tracking-wider">Available Supported Providers</h4>
         <div className="grid grid-cols-1 md:grid-cols-3 gap-4">

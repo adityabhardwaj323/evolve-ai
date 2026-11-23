@@ -48,8 +48,8 @@ export class OpenAICompatibleAdapter implements IProviderAdapter {
     return this.config.staticModels.map((m) => ({
       ...m,
       isFallback: true,
-      lastVerifiedDate: '2026-11-23',
-      status: 'active',
+      lastVerifiedDate: '2024-11-01',
+      status: 'unknown',
     }));
   }
 
@@ -246,6 +246,13 @@ export class OpenAICompatibleAdapter implements IProviderAdapter {
         }
       }
     } finally {
+      try {
+        if (options.signal?.aborted) {
+          await reader.cancel('Stream aborted');
+        }
+      } catch {
+        // ignore cancellation error
+      }
       reader.releaseLock();
     }
 

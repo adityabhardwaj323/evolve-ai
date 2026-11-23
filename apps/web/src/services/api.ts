@@ -102,6 +102,12 @@ export const ProvidersApi = {
   async testCredential(id: string) {
     return apiRequest(`/providers/credentials/${id}/test`, { method: 'POST' });
   },
+  async smokeTestCredential(id: string, operations?: Array<'auth' | 'generation' | 'streaming'>) {
+    return apiRequest(`/providers/credentials/${id}/smoke-test`, {
+      method: 'POST',
+      body: JSON.stringify({ operations }),
+    });
+  },
   async deleteCredential(id: string) {
     return apiRequest(`/providers/credentials/${id}`, { method: 'DELETE' });
   },

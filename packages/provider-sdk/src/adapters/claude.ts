@@ -42,31 +42,31 @@ export class ClaudeAdapter implements IProviderAdapter {
         name: 'Claude 3.5 Haiku',
         provider: 'claude',
         contextWindow: 200000,
-        description: 'Fast, lightweight intelligence with state-of-the-art speeds.',
+        description: 'Fast, lightweight intelligence with state-of-the-art speeds (Static fallback catalogue - access requires active user account tier).',
         isDefault: true,
         isFallback: true,
-        lastVerifiedDate: '2026-11-23',
-        status: 'active',
+        lastVerifiedDate: '2024-11-01',
+        status: 'unknown',
       },
       {
         id: 'claude-3-5-sonnet-20241022',
         name: 'Claude 3.5 Sonnet',
         provider: 'claude',
         contextWindow: 200000,
-        description: 'Most intelligent model from Anthropic for complex coding and reasoning.',
+        description: 'Anthropic model for complex coding and reasoning (Static fallback catalogue - access requires active user account tier).',
         isFallback: true,
-        lastVerifiedDate: '2026-11-23',
-        status: 'active',
+        lastVerifiedDate: '2024-11-01',
+        status: 'unknown',
       },
       {
         id: 'claude-3-opus-20240229',
         name: 'Claude 3 Opus',
         provider: 'claude',
         contextWindow: 200000,
-        description: 'Powerful model for highly complex open-ended analysis.',
+        description: 'High-capability model for complex open-ended analysis (Static fallback catalogue - access requires active user account tier).',
         isFallback: true,
-        lastVerifiedDate: '2026-11-23',
-        status: 'active',
+        lastVerifiedDate: '2024-03-01',
+        status: 'unknown',
       },
     ];
   }
@@ -270,6 +270,10 @@ export class ClaudeAdapter implements IProviderAdapter {
 
     try {
       while (true) {
+        if (options.signal?.aborted) {
+          throw new DOMException('Generation cancelled by user', 'AbortError');
+        }
+
         const { done, value } = await reader.read();
         if (done) break;
 
@@ -300,6 +304,13 @@ export class ClaudeAdapter implements IProviderAdapter {
         }
       }
     } finally {
+      try {
+        if (options.signal?.aborted) {
+          await reader.cancel('Stream aborted');
+        }
+      } catch {
+        // ignore cancellation error
+      }
       reader.releaseLock();
     }
 
