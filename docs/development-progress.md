@@ -98,6 +98,41 @@
   - Hardened streaming reader cleanup: explicitly calls `reader.cancel()` and `reader.releaseLock()` upon abort or error, cleanly releasing underlying network sockets.
   - Persists partial assistant responses to Cloudflare D1 if user stops generation mid-stream.
 - [x] Smoke-Test Cost Transparency & UX:
+  - Users can select test operation granularity (`auth`, `generation`, `streaming`).
+  - Clear cost disclaimer displayed before executing token-incurring smoke tests.
+  - Double-click and duplicate-submission protection with clear live test progress UI.
+
+### Milestone 4: Personal Intelligence & Memory Engine
+- [x] Memory Engine package architecture (`packages/memory-engine`):
+  - Structured extraction pipeline with sensitive data and credential rejection (`containsSensitiveData`).
+  - Token Jaccard deduplication and conflict detection (`deduplicateAndDetectConflicts`).
+  - Lifecycle state machine supporting `candidate`, `approved`, `active`, `updated`, `archived`, `deleted`, `unverified`, `rejected`, `expired`.
+  - Automatic memory approval **disabled by default** to give users full agency.
+  - Hybrid retrieval ranking scoring relevance via status, category, recency, importance, confidence, and pinned priority.
+  - Strict project boundary enforcement preventing cross-project memory leakage.
+  - Memory context prompt generation formatted as untrusted reference context.
+- [x] Cloudflare D1 Database Schema Migration (`0004_personal_intelligence_and_memory.sql`):
+  - Additive migration adding `title`, `importance`, `last_accessed_at`, `expires_at`, `is_pinned`, `verification_status`, and `source_message_id` to `memories`.
+  - Added `memory_access_logs` table for tracking context injection provenance.
+  - Updated `user_preferences` with `auto_approve_memories` (default `0`).
+  - Updated `feedback` with `memory_id` and `correction_text`.
+- [x] Comprehensive Backend APIs (`workers/api/src/routes/memory.ts`, `graph.ts`, `feedback.ts`):
+  - Memory CRUD: `GET /memory`, `GET /memory/stats`, `POST /memory`, `POST /memory/extract`, `POST /memory/retrieve`.
+  - Lifecycle Actions: `POST /memory/:id/approve`, `POST /memory/:id/reject`, `POST /memory/:id/archive`, `POST /memory/:id/restore`, `POST /memory/:id/pin`, `PATCH /memory/:id`.
+  - Data Ownership & Privacy: `GET /memory/export` (JSON export) and `DELETE /memory/all` (complete GDPR/privacy purge).
+  - Knowledge Graph: `GET /knowledge-graph`, `POST /knowledge-graph/entities`, `POST /knowledge-graph/relations`, `DELETE /knowledge-graph/entities/:id`.
+  - Feedback Loop: `GET /feedback`, `POST /feedback` (with auto-generation of candidate memory for corrections).
+- [x] Provider Context Injection (`workers/api/src/routes/chat.ts`):
+  - Authenticated retrieval injecting compact memory context into all 6 providers (Gemini, OpenAI, Claude, Grok, Mistral, OpenRouter).
+  - Context formatted under strict untrusted reference boundaries; chat proceeds uninterrupted if retrieval fails.
+- [x] Complete Functional Frontend UI (`apps/web`):
+  - Memory Center: Real D1 data, metrics, candidate review section, category/status filters, manual memory creation modal, and export/delete controls.
+  - Knowledge Graph: Entity exploration with connected relations and attributes.
+  - Feedback Loop & Evolution Lab: Measured retrieval counts, useful/irrelevant ratios, correction logs, and zero fabricated stats.
+- [x] Testing & Verification:
+  - 100% test pass rate across `@evolve-ai/provider-sdk`, `packages/memory-engine`, and `workers/api`.
+  - Complete monorepo TypeScript verification with 0 errors.
+  - Production frontend build completed with zero bundle warnings.
   - Rebranded smoke test UI and backend to: `"Provider Connection & Generation Test — May Incur API Charges"`.
   - Provided selectable operations: `auth` (free model discovery), `generation` (single minimal text generation), and `streaming` (SSE stream verification).
   - Disclosed upfront billing warnings before any generation test.

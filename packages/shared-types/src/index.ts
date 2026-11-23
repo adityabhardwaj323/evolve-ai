@@ -160,38 +160,69 @@ export interface CompareResponse {
 }
 
 export type MemoryCategory =
-  | 'user_preference'
-  | 'personal_interest'
-  | 'learning_goal'
-  | 'technical_knowledge'
-  | 'professional_goal'
-  | 'ongoing_project'
-  | 'project_architecture'
-  | 'important_decision'
-  | 'previous_correction'
-  | 'repeated_pattern'
-  | 'user_approved_fact'
+  | 'personal_preference'
+  | 'interest'
+  | 'goal_ambition'
+  | 'skill_knowledge'
+  | 'project'
+  | 'decision'
+  | 'verified_fact'
+  | 'correction'
+  | 'working_preference'
   | 'temporary_context';
 
 export type MemoryStatus =
   | 'candidate'
   | 'approved'
+  | 'active'
+  | 'updated'
   | 'unverified'
   | 'rejected'
-  | 'archived';
+  | 'expired'
+  | 'archived'
+  | 'deleted';
+
+export type VerificationStatus = 'verified' | 'unverified';
 
 export interface Memory {
   id: string;
   userId: string;
   projectId?: string | null;
   category: MemoryCategory;
+  title?: string;
   content: string;
-  sourceType: 'conversation' | 'direct_entry' | 'feedback_correction';
-  sourceId?: string | null;
-  status: MemoryStatus;
   confidence: number;
+  importance: number;
+  sourceType: 'conversation' | 'direct_entry' | 'feedback_correction';
+  sourceId?: string | null; // conversationId
+  sourceMessageId?: string | null;
+  status: MemoryStatus;
+  verificationStatus: VerificationStatus;
+  isPinned: boolean;
+  expiresAt?: string | null;
+  lastAccessedAt?: string | null;
   createdAt: string;
   updatedAt: string;
+}
+
+export interface MemoryContextPackage {
+  relevantMemories: Array<{
+    id: string;
+    category: MemoryCategory;
+    title?: string;
+    content: string;
+    confidence: number;
+    importance: number;
+    status: MemoryStatus;
+    verificationStatus: VerificationStatus;
+  }>;
+  projectContext?: {
+    id: string;
+    name: string;
+    description?: string;
+    goals?: string;
+    techStack?: string;
+  } | null;
 }
 
 export interface Project {
@@ -210,7 +241,7 @@ export interface KnowledgeEntity {
   userId: string;
   projectId?: string | null;
   name: string;
-  entityType: string;
+  entityType: 'Person' | 'Project' | 'Technology' | 'Goal' | 'Organization' | 'Skill' | 'Concept' | 'Decision';
   description?: string;
   createdAt: string;
 }
@@ -220,28 +251,54 @@ export interface KnowledgeRelation {
   userId: string;
   sourceEntityId: string;
   targetEntityId: string;
-  relationType: string;
+  relationType:
+    | 'WORKS_ON'
+    | 'USES'
+    | 'PREFERS'
+    | 'LEARNED'
+    | 'DEPENDS_ON'
+    | 'RELATED_TO'
+    | 'DECIDED'
+    | 'PURSUES';
   createdAt: string;
 }
 
 export type FeedbackType =
-  | 'positive'
-  | 'negative'
   | 'helpful'
-  | 'incorrect_information'
-  | 'incomplete_response'
-  | 'wrong_personalization'
-  | 'custom_correction';
+  | 'not_helpful'
+  | 'incorrect'
+  | 'incomplete'
+  | 'outdated'
+  | 'poor_personalization'
+  | 'missing_context';
 
 export interface FeedbackRecord {
   id: string;
   userId: string;
+  conversationId?: string | null;
   messageId: string;
+  providerType?: ProviderType;
+  model?: string;
   rating: number; // 1 for thumbs up, -1 for thumbs down
   feedbackType: FeedbackType;
   correctionText?: string | null;
+  memoryIds?: string[];
   status: 'received' | 'reviewed' | 'applied_to_candidate_memory';
   createdAt: string;
+}
+
+export interface EvolutionMetrics {
+  totalMemories: number;
+  activeMemories: number;
+  candidateMemories: number;
+  approvedMemories: number;
+  rejectedMemories: number;
+  archivedMemories: number;
+  duplicatesDetected: number;
+  conflictsDetected: number;
+  totalRetrievals: number;
+  totalCorrections: number;
+  relevanceFeedbackRate?: number;
 }
 
 export interface ApiResponse<T = unknown> {

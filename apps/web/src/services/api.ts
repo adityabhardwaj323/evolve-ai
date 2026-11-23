@@ -7,6 +7,11 @@ import {
   Message,
   UsageEvent,
   CompareResponse,
+  Memory,
+  KnowledgeEntity,
+  KnowledgeRelation,
+  FeedbackRecord,
+  FeedbackType,
 } from '@evolve-ai/shared-types';
 
 const API_BASE = (import.meta as any).env?.VITE_API_URL || 'http://localhost:8787';
@@ -250,5 +255,96 @@ export const UsageApi = {
       byProvider: Array<{ provider_type: ProviderType; requests: number; tokens: number }>;
       recentEvents: UsageEvent[];
     }>('/usage');
+  },
+};
+
+// Memory Center API
+export const MemoryApi = {
+  async list(filters?: { status?: string; category?: string; projectId?: string; search?: string }): Promise<Memory[]> {
+    let url = '/memory?';
+    if (filters?.status) url += `status=${encodeURIComponent(filters.status)}&`;
+    if (filters?.category) url += `category=${encodeURIComponent(filters.category)}&`;
+    if (filters?.projectId !== undefined) url += `projectId=${encodeURIComponent(filters.projectId)}&`;
+    if (filters?.search) url += `search=${encodeURIComponent(filters.search)}&`;
+
+    const res = await apiRequest<Memory[]>(url);
+    return res.data || [];
+  },
+  async getStats(): Promise<any> {
+    const res = await apiRequest('/memory/stats');
+    return res.data || {};
+  },
+  async create(data: { category: string; content: string; title?: string; projectId?: string; importance?: number }): Promise<any> {
+    return apiRequest('/memory', { method: 'POST', body: JSON.stringify(data) });
+  },
+  async approve(id: string): Promise<any> {
+    return apiRequest(`/memory/${id}/approve`, { method: 'POST' });
+  },
+  async reject(id: string): Promise<any> {
+    return apiRequest(`/memory/${id}/reject`, { method: 'POST' });
+  },
+  async archive(id: string): Promise<any> {
+    return apiRequest(`/memory/${id}/archive`, { method: 'POST' });
+  },
+  async restore(id: string): Promise<any> {
+    return apiRequest(`/memory/${id}/restore`, { method: 'POST' });
+  },
+  async pin(id: string): Promise<any> {
+    return apiRequest(`/memory/${id}/pin`, { method: 'POST' });
+  },
+  async delete(id: string): Promise<any> {
+    return apiRequest(`/memory/${id}`, { method: 'DELETE' });
+  },
+  async deleteAll(): Promise<any> {
+    return apiRequest('/memory/all', { method: 'DELETE' });
+  },
+  async export(): Promise<any> {
+    const res = await apiRequest('/memory/export');
+    return res.data;
+  },
+  async extract(conversationId: string, messages: any[], providerType?: string): Promise<any> {
+    const res = await apiRequest('/memory/extract', {
+      method: 'POST',
+      body: JSON.stringify({ conversationId, messages, providerType }),
+    });
+    return res.data;
+  },
+};
+
+// Knowledge Graph API
+export const GraphApi = {
+  async getGraph(projectId?: string): Promise<{ entities: KnowledgeEntity[]; relations: KnowledgeRelation[] }> {
+    const url = projectId ? `/knowledge-graph?projectId=${encodeURIComponent(projectId)}` : '/knowledge-graph';
+    const res = await apiRequest<{ entities: KnowledgeEntity[]; relations: KnowledgeRelation[] }>(url);
+    return res.data || { entities: [], relations: [] };
+  },
+  async createEntity(data: { name: string; entityType: string; description?: string; projectId?: string }) {
+    return apiRequest('/knowledge-graph/entities', { method: 'POST', body: JSON.stringify(data) });
+  },
+  async createRelation(data: { sourceEntityId: string; targetEntityId: string; relationType: string }) {
+    return apiRequest('/knowledge-graph/relations', { method: 'POST', body: JSON.stringify(data) });
+  },
+  async deleteEntity(id: string) {
+    return apiRequest(`/knowledge-graph/entities/${id}`, { method: 'DELETE' });
+  },
+};
+
+// Feedback API
+export const FeedbackApi = {
+  async list(): Promise<FeedbackRecord[]> {
+    const res = await apiRequest<FeedbackRecord[]>('/feedback');
+    return res.data || [];
+  },
+  async submit(data: {
+    messageId: string;
+    conversationId?: string;
+    providerType?: ProviderType;
+    model?: string;
+    rating: number;
+    feedbackType: FeedbackType;
+    correctionText?: string;
+    memoryIds?: string[];
+  }) {
+    return apiRequest('/feedback', { method: 'POST', body: JSON.stringify(data) });
   },
 };

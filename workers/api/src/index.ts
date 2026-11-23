@@ -9,6 +9,8 @@ import { conversationsRouter } from './routes/conversations.js';
 import { memoryRouter } from './routes/memory.js';
 import { projectsRouter } from './routes/projects.js';
 import { usageRouter } from './routes/usage.js';
+import { graphRouter } from './routes/graph.js';
+import { feedbackRouter } from './routes/feedback.js';
 
 export interface Env {
   DB: D1Database;
@@ -108,6 +110,8 @@ app.route('/conversations', conversationsRouter);
 app.route('/memory', memoryRouter);
 app.route('/projects', projectsRouter);
 app.route('/usage', usageRouter);
+app.route('/knowledge-graph', graphRouter);
+app.route('/feedback', feedbackRouter);
 
 // Error handling
 app.onError((err, c) => {

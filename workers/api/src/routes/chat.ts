@@ -3,7 +3,12 @@ import { Env } from '../index.js';
 import { requireAuth, AuthContext } from '../middleware/auth.js';
 import { decryptCredential } from '../security/crypto.js';
 import { ProviderRegistry } from '@evolve-ai/provider-sdk';
-import { ProviderType, StreamEvent } from '@evolve-ai/shared-types';
+import { ProviderType, StreamEvent, Memory } from '@evolve-ai/shared-types';
+import {
+  retrieveRelevantMemories,
+  buildMemoryContextPackage,
+  formatMemoryContextPrompt,
+} from '@evolve-ai/memory-engine';
 
 export const chatRouter = new Hono<{ Bindings: Env; Variables: AuthContext }>();
 chatRouter.use('*', requireAuth);
@@ -25,8 +30,90 @@ const registry = ProviderRegistry.getInstance();
 const localActiveGenerations = new Map<string, AbortController>();
 
 /**
- * Helper to fetch and decrypt a user's active credential for a given providerType
+ * Helper to retrieve and format personal memory context before dispatching to any provider
  */
+async function resolveMemoryContext(
+  db: D1Database,
+  userId: string,
+  latestPrompt: string,
+  conversationId?: string
+): Promise<{ effectiveSystemPrompt: string; injectedMemoryIds: string[] }> {
+  // Check if user disabled memory injection
+  const prefs = await db.prepare(
+    'SELECT memory_injection_enabled FROM user_preferences WHERE user_id = ?'
+  ).bind(userId).first<any>();
+
+  if (prefs && prefs.memory_injection_enabled === 0) {
+    return { effectiveSystemPrompt: '', injectedMemoryIds: [] };
+  }
+
+  // Check if conversation belongs to a project
+  let projectId: string | null = null;
+  if (conversationId) {
+    const conv = await db.prepare('SELECT project_id FROM conversations WHERE id = ? AND user_id = ?')
+      .bind(conversationId, userId).first<any>();
+    if (conv?.project_id) {
+      projectId = conv.project_id;
+    }
+  }
+
+  // Load active/approved memories
+  const rows = await db.prepare(
+    'SELECT * FROM memories WHERE user_id = ? AND status != "deleted"'
+  ).bind(userId).all();
+
+  const allMemories: Memory[] = (rows.results || []).map((r: any) => ({
+    id: r.id,
+    userId: r.user_id,
+    projectId: r.project_id || null,
+    category: r.category,
+    title: r.title,
+    content: r.content,
+    confidence: r.confidence ?? 0.8,
+    importance: r.importance ?? 0.5,
+    sourceType: r.source_type,
+    sourceId: r.source_id,
+    sourceMessageId: r.source_message_id,
+    status: r.status,
+    verificationStatus: r.verification_status || 'unverified',
+    isPinned: Boolean(r.is_pinned),
+    createdAt: r.created_at,
+    updatedAt: r.updated_at,
+  }));
+
+  const relevant = retrieveRelevantMemories(allMemories, {
+    userId,
+    projectId,
+    query: latestPrompt,
+    limit: 5,
+  });
+
+  if (relevant.length === 0 && !projectId) {
+    return { effectiveSystemPrompt: '', injectedMemoryIds: [] };
+  }
+
+  let projectDetails = null;
+  if (projectId) {
+    projectDetails = await db.prepare('SELECT id, name, description, goals, tech_stack FROM projects WHERE id = ? AND user_id = ?')
+      .bind(projectId, userId).first<any>();
+  }
+
+  const contextPackage = buildMemoryContextPackage(relevant, projectDetails);
+  const memoryBlock = formatMemoryContextPrompt(contextPackage);
+
+  // Log retrieval in memory_access_logs
+  for (const m of relevant) {
+    await db.prepare(
+      `INSERT INTO memory_access_logs (id, user_id, conversation_id, memory_id, retrieval_query, created_at)
+       VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`
+    ).bind(crypto.randomUUID(), userId, conversationId || null, m.id, latestPrompt.slice(0, 100)).run();
+  }
+
+  return {
+    effectiveSystemPrompt: memoryBlock,
+    injectedMemoryIds: relevant.map((m) => m.id),
+  };
+}
 async function getDecryptedCredential(
   db: D1Database,
   secret: string,
@@ -88,13 +175,23 @@ chatRouter.post('/generate', async (c) => {
     const cred = await getDecryptedCredential(c.env.DB, c.env.ENCRYPTION_SECRET, user.id, providerType, credentialId);
     const adapter = registry.get(providerType);
 
+    const latestPrompt = messages.filter((m: any) => m.role === 'user').pop()?.content || '';
+    const { effectiveSystemPrompt, injectedMemoryIds } = await resolveMemoryContext(
+      c.env.DB,
+      user.id,
+      latestPrompt,
+      conversationId
+    );
+
+    const mergedSystemPrompt = [systemPrompt, effectiveSystemPrompt].filter(Boolean).join('\n\n');
+
     const startTime = Date.now();
     const result = await adapter.generateText(
       cred.rawKey,
       {
         model,
         messages,
-        systemPrompt,
+        systemPrompt: mergedSystemPrompt || undefined,
         temperature,
         maxTokens,
       },
@@ -216,12 +313,22 @@ chatRouter.post('/stream', async (c) => {
     let finalUsage: any = null;
 
     try {
+      const latestPrompt = messages.filter((m: any) => m.role === 'user').pop()?.content || '';
+      const { effectiveSystemPrompt, injectedMemoryIds } = await resolveMemoryContext(
+        c.env.DB,
+        user.id,
+        latestPrompt,
+        conversationId
+      );
+
+      const mergedSystemPrompt = [systemPrompt, effectiveSystemPrompt].filter(Boolean).join('\n\n');
+
       const response = await adapter.streamText(
         cred.rawKey,
         {
           model,
           messages,
-          systemPrompt,
+          systemPrompt: mergedSystemPrompt || undefined,
           temperature,
           maxTokens,
           signal: upstreamController.signal,
