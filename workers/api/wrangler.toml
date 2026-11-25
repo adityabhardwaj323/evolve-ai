@@ -7,8 +7,44 @@ compatibility_flags = ["nodejs_compat"]
 ENVIRONMENT = "development"
 CLIENT_ORIGIN = "http://localhost:5173"
 
+# Default Local D1 binding
 [[d1_databases]]
 binding = "DB"
 database_name = "evolve-ai-db"
 database_id = "local-d1-db"
+migrations_dir = "migrations"
+
+# ==============================================================================
+# Staging Environment Configuration
+# Target: Cloudflare Workers Free Tier staging environment
+# Note: database_id is a placeholder until staging D1 database is created in Cloudflare
+# ==============================================================================
+[env.staging]
+name = "evolve-ai-api-staging"
+
+[env.staging.vars]
+ENVIRONMENT = "staging"
+CLIENT_ORIGIN = "https://staging.evolve-ai.pages.dev"
+
+[[env.staging.d1_databases]]
+binding = "DB"
+database_name = "evolve-ai-db-staging"
+database_id = "staging-d1-db-placeholder"
+migrations_dir = "migrations"
+
+# ==============================================================================
+# Production Environment Configuration
+# Target: Cloudflare Workers Free Tier production environment
+# ==============================================================================
+[env.production]
+name = "evolve-ai-api-production"
+
+[env.production.vars]
+ENVIRONMENT = "production"
+CLIENT_ORIGIN = "https://evolve-ai.pages.dev"
+
+[[env.production.d1_databases]]
+binding = "DB"
+database_name = "evolve-ai-db-production"
+database_id = "production-d1-db-placeholder"
 migrations_dir = "migrations"
